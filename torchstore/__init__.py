@@ -31,6 +31,7 @@ from torchstore.strategy import (
     LocalRankStrategy,
     TorchStoreStrategy,
 )
+from torchstore.controller import Publication
 
 initialize_spmd = spmd.initialize
 
@@ -63,6 +64,7 @@ __all__ = [
     "LocalRankStrategy",
     "HostStrategy",
     "ControllerStorageVolumes",
+    "Publication",
     "put_state_dict",
     "get_state_dict",
     "reset_client",
