@@ -8,6 +8,56 @@ import logging
 import os
 import sys
 import time
+from collections import defaultdict
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from typing import Iterator
+
+
+@dataclass
+class LatencyCollector:
+    """Collect latency observations made by the current async task tree.
+
+    The collector is deliberately backend-agnostic.  Callers such as TitanRL can
+    turn the returned values into their native TensorBoard/W&B metrics without
+    making TorchStore depend on either logging backend.
+    """
+
+    observations: dict[str, list[float]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+
+    def record(self, key: str, value: float) -> None:
+        self.observations[key].append(float(value))
+
+    def snapshot(self) -> dict[str, list[float]]:
+        return {key: list(values) for key, values in self.observations.items()}
+
+
+_latency_collector: ContextVar[LatencyCollector | None] = ContextVar(
+    "torchstore_latency_collector", default=None
+)
+
+
+@contextmanager
+def collect_latencies() -> Iterator[LatencyCollector]:
+    """Capture TorchStore latency observations in the current async context."""
+
+    collector = LatencyCollector()
+    token = _latency_collector.set(collector)
+    try:
+        yield collector
+    finally:
+        _latency_collector.reset(token)
+
+
+def record_observation(key: str, value: float) -> None:
+    """Record a diagnostic value when a latency collector is active."""
+
+    collector = _latency_collector.get()
+    if collector is not None:
+        collector.record(key, value)
 
 
 def init_logging():
@@ -55,6 +105,16 @@ class LatencyTracker:
         now = time.perf_counter()
         elapsed = now - self.last_step
         throughput = self._format_throughput(elapsed, tensor, nbytes)
+        metric_prefix = f"{self.name}/{step_name}"
+        record_observation(f"{metric_prefix}/seconds", elapsed)
+        if nbytes is None and tensor is not None:
+            nbytes = tensor.numel() * tensor.element_size()
+        if nbytes is not None:
+            record_observation(f"{metric_prefix}/bytes", nbytes)
+            if elapsed > 0:
+                record_observation(
+                    f"{metric_prefix}/throughput_gbps", (nbytes / 1e9) / elapsed
+                )
         logging.log(
             self.level, f"{self.name}:{step_name} took {elapsed:.4f}s{throughput}"
         )
@@ -63,4 +123,12 @@ class LatencyTracker:
     def track_e2e(self, nbytes=None) -> None:
         elapsed = time.perf_counter() - self.start_time
         throughput = self._format_throughput(elapsed, nbytes=nbytes)
+        metric_prefix = f"{self.name}/e2e"
+        record_observation(f"{metric_prefix}/seconds", elapsed)
+        if nbytes is not None:
+            record_observation(f"{metric_prefix}/bytes", nbytes)
+            if elapsed > 0:
+                record_observation(
+                    f"{metric_prefix}/throughput_gbps", (nbytes / 1e9) / elapsed
+                )
         logging.log(self.level, f"{self.name} took {elapsed:.4f}s{throughput}")
