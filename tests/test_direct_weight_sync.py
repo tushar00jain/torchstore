@@ -10,14 +10,22 @@ Uses a MockRDMABuffer that copies source bytes into the dest byte view,
 simulating what real RDMA does. No GPU or RDMA infrastructure needed.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+import torchstore.direct_transport as direct_transport
+import torchstore.state_dict_utils as state_dict_utils
+import torchstore.strategy as strategy_module
+from torchstore.direct_transport import DirectTransport, create_direct_transport
 from torchstore.direct_weight_sync import (
     DirectWeightSyncDest,
     DirectWeightSyncSource,
     RDMAWeightHandle,
 )
+from torchstore.strategy import TorchStoreStrategy
+from torchstore.transport import TransportType
 from torchstore.transport.types import TensorSlice
 from torchstore.utils import to_byte_view
 
@@ -274,3 +282,174 @@ async def test_transfer_dtype():
     sync2 = DirectWeightSyncDest()
     await sync2.pull({"weight": [handle]}, {"weight": dest2})
     assert torch.equal(dest2, torch.full((10, 10), 42.0, dtype=torch.bfloat16))
+
+
+class _FakeStore:
+    def __init__(self):
+        self.values = {}
+
+    async def put(self, key, value):
+        self.values[key] = value
+
+    async def get(self, key):
+        return self.values[key]
+
+    async def exists(self, key):
+        return key in self.values
+
+    async def delete(self, key):
+        self.values.pop(key, None)
+
+    async def keys(self, prefix=None):
+        return [key for key in self.values if prefix is None or key.startswith(prefix)]
+
+
+class _FakeSourceConnection:
+    connection_info = b"source"
+
+    def __init__(self, _request):
+        self.closed = False
+
+    def register(self, tensor):
+        return tensor
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeDestinationConnection:
+    connection_info = b"destination"
+
+    def __init__(self):
+        self.connected = False
+        self.closed = False
+
+    def connect(self, connection_info):
+        assert connection_info == b"source"
+        self.connected = True
+
+    async def read_into(self, remote_buffer, tensor):
+        assert self.connected
+        tensor.copy_(to_byte_view(remote_buffer))
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize(
+    "backend", [TransportType.Rdma4Py, TransportType.TorchComms]
+)
+async def test_selectable_direct_transport(monkeypatch, backend):
+    """Both selectable transports use the direct source-to-destination plan."""
+    if backend == TransportType.Rdma4Py:
+        monkeypatch.setattr(
+            "torchstore.transport.rdma4py.rdma4py_transport_available",
+            lambda: True,
+        )
+    else:
+        monkeypatch.setattr(
+            "torchstore.transport.torchcomms.cache.torchcomms_rdma_available",
+            lambda: True,
+        )
+    monkeypatch.setattr(direct_transport, "_require_cuda_tensor", lambda *_: None)
+    monkeypatch.setattr(direct_transport, "_cuda_synchronize", lambda *_: None)
+
+    store = _FakeStore()
+    source_tensor = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    destination_tensor = torch.zeros_like(source_tensor)
+    source = direct_transport.DirectTransportWeightSyncSource(
+        backend,
+        store,
+        "model",
+        lambda connection_info, _device: _FakeSourceConnection(connection_info),
+    )
+    destination = direct_transport.DirectTransportWeightSyncDest(
+        backend,
+        store,
+        "model",
+        lambda _device: _FakeDestinationConnection(),
+    )
+
+    await source.register({"weight": source_tensor}, rank=0, transfer_dtype=None)
+    await destination.pull(num_ranks=1, user_state_dict={"weight": destination_tensor})
+    assert torch.equal(destination_tensor, source_tensor)
+
+    source_tensor.fill_(17)
+    source.refresh()
+    await destination.pull(num_ranks=1, user_state_dict={"weight": destination_tensor})
+    assert torch.equal(destination_tensor, source_tensor)
+
+    await destination.close()
+    await source.close()
+
+
+async def test_state_dict_helpers_use_strategy_transport(monkeypatch):
+    calls = []
+
+    async def fake_put(store, state_dict, key, transfer_dtype, backend):
+        calls.append(("put", backend))
+
+    async def fake_get(store, key, user_state_dict, backend):
+        calls.append(("get", backend))
+
+    monkeypatch.setattr(state_dict_utils, "_put_state_dict_direct_rdma", fake_put)
+    monkeypatch.setattr(state_dict_utils, "_get_state_dict_direct_rdma", fake_get)
+
+    store = SimpleNamespace(
+        strategy=TorchStoreStrategy(TransportType.Rdma4Py)
+    )
+    state_dict = {"weight": torch.ones(2)}
+    await state_dict_utils.put_state_dict(
+        store,
+        state_dict,
+        "model",
+        direct_rdma=True,
+    )
+    result = await state_dict_utils.get_state_dict(
+        store,
+        "model",
+        state_dict,
+        direct_rdma=True,
+    )
+
+    assert result is state_dict
+    assert calls == [
+        ("put", TransportType.Rdma4Py),
+        ("get", TransportType.Rdma4Py),
+    ]
+
+
+async def test_strategy_resolves_normal_and_direct_transports_separately(monkeypatch):
+    monkeypatch.setattr(
+        strategy_module,
+        "get_available_transport",
+        lambda _storage_volume_ref: TransportType.Gloo,
+    )
+    monkeypatch.setattr(
+        strategy_module,
+        "get_available_direct_transport",
+        lambda: TransportType.Rdma4Py,
+    )
+
+    strategy = TorchStoreStrategy()
+    assert strategy.get_transport_type(object()) == TransportType.Gloo
+    assert strategy.get_direct_transport_type() == TransportType.Rdma4Py
+
+
+async def test_direct_transport_rejects_non_rdma_strategy():
+    with pytest.raises(ValueError, match="does not support direct weight sync"):
+        TorchStoreStrategy(TransportType.Gloo).get_direct_transport_type()
+
+
+@pytest.mark.parametrize(
+    "transport_type",
+    [
+        TransportType.MonarchRDMA,
+        TransportType.Rdma4Py,
+        TransportType.TorchComms,
+    ],
+)
+async def test_direct_transport_factory(transport_type):
+    transport = create_direct_transport(transport_type, _FakeStore(), "model")
+
+    assert isinstance(transport, DirectTransport)

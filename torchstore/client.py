@@ -77,7 +77,10 @@ class LocalClient:
             requests.append(request)
 
         storage_volume_ref = self.strategy.select_storage_volume()
-        transport_buffer = create_transport_buffer(storage_volume_ref)
+        transport_buffer = create_transport_buffer(
+            storage_volume_ref,
+            self.strategy.get_transport_type(storage_volume_ref),
+        )
         latency_tracker.track_step("create transport buffer")
 
         await transport_buffer.put_to_storage_volume(requests)
@@ -218,12 +221,13 @@ class LocalClient:
         all_volume_ids: set[str] = {vid for vm in volume_maps.values() for vid in vm}
 
         # eagerly make transport buffers for all volumes
-        transport_buffer_map = {
-            volume_id: create_transport_buffer(
-                self.strategy.get_storage_volume(volume_id)
+        transport_buffer_map = {}
+        for volume_id in all_volume_ids:
+            storage_volume_ref = self.strategy.get_storage_volume(volume_id)
+            transport_buffer_map[volume_id] = create_transport_buffer(
+                storage_volume_ref,
+                self.strategy.get_transport_type(storage_volume_ref),
             )
-            for volume_id in all_volume_ids
-        }
 
         # collect the requests for each volume
         volume_requests, whole_keys = self._build_volume_requests(

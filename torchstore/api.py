@@ -386,12 +386,12 @@ async def put_state_dict(
         direct_rdma (bool): If True, register RDMA handles pointing at the
             caller's GPU memory instead of copying data to a StorageVolume.
             First call registers handles; subsequent calls refresh staging
-            buffers for non-contiguous params.
+            buffers for non-contiguous params. The strategy resolves the direct
+            transport from its ``default_transport_type``.
         transfer_dtype (torch.dtype, optional): If set, cast floating-point
             weights to this dtype for transfer. Allows the source to keep
             higher-precision master weights (e.g. float32) while transferring
             in a lower precision (e.g. bfloat16).
-
     Example:
         >>> model = torch.nn.Linear(10, 5)
         >>> await put_state_dict(model.state_dict(), "model_checkpoint")
@@ -423,8 +423,9 @@ async def get_state_dict(
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
         direct_rdma (bool): If True, pull weights directly from the source's
             GPU memory via one-sided RDMA reads. Handles are fetched from
-            TorchStore on the first call and cached for subsequent calls.
-
+            TorchStore on the first call and cached for subsequent calls. The
+            strategy resolves the direct transport from its
+            ``default_transport_type``.
     Returns:
         dict: The retrieved state_dict.
 
@@ -434,5 +435,9 @@ async def get_state_dict(
     """
     cl = await client(store_name)
     return await torchstore.state_dict_utils.get_state_dict(
-        cl, key, user_state_dict, strict, direct_rdma=direct_rdma
+        cl,
+        key,
+        user_state_dict,
+        strict,
+        direct_rdma=direct_rdma,
     )
