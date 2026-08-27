@@ -15,6 +15,10 @@ from torchstore.transport.monarch_rdma import (
     MonarchRDMATransportBuffer,
 )
 from torchstore.transport.monarch_rpc import MonarchRPCTransportBuffer
+from torchstore.transport.rdma4py import (
+    rdma4py_transport_available,
+    Rdma4PyTransportBuffer,
+)
 from torchstore.transport.shared_memory import (
     is_local_to_volume,
     SharedMemoryTransportBuffer,
@@ -44,24 +48,37 @@ class TransportType(Enum):
     TorchCommsRDMA = TorchComms  # Backward compatible alias
     Gloo = auto()
     SharedMemory = auto()  # POSIX shared memory for same-host transfers
+    Rdma4Py = auto()
+
+
+def get_available_direct_transport() -> TransportType | None:
+    """Return the preferred transport for direct GPU-to-GPU transfers."""
+    if torchcomms_rdma_available():
+        return TransportType.TorchComms
+    if rdma4py_transport_available():
+        return TransportType.Rdma4Py
+    if monarch_rdma_transport_available():
+        return TransportType.MonarchRDMA
+    return None
 
 
 def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> TransportType:
     """Determine the best available transport type for the given storage volume.
 
     Prefers SharedMemory for same-host transfers, then TorchComms (Uniflow RDMA/NVLink),
-    then MonarchRDMA, then Gloo, otherwise falls back to MonarchRPC.
+    then rdma4py, then MonarchRDMA, then Gloo, otherwise falls back to MonarchRPC.
     """
     # Prefer SharedMemory for same-host transfers
     if SHM_ENABLED and is_local_to_volume(storage_volume_ref):
         return TransportType.SharedMemory
 
-    # Fall back to RDMA if available (prefer TorchComms over Monarch RDMA)
     if torchcomms_uniflow_available() or torchcomms_rdma_available():
         return TransportType.TorchComms
-    elif monarch_rdma_transport_available():
+    if rdma4py_transport_available():
+        return TransportType.Rdma4Py
+    if monarch_rdma_transport_available():
         return TransportType.MonarchRDMA
-    elif gloo_available():
+    if gloo_available():
         return TransportType.Gloo
 
     return TransportType.MonarchRPC
@@ -71,21 +88,25 @@ def _log_transport_resolution(
     storage_volume_ref: "StorageVolumeRef", transport_type: TransportType
 ) -> None:
     logger.info(
-        "[ts-transport] resolved=%s (uniflow=%s, tc_rdma=%s, monarch_rdma=%s, gloo=%s, shm=%s)",
+        "[ts-transport] resolved=%s (uniflow=%s, tc_rdma=%s, rdma4py=%s, monarch_rdma=%s, gloo=%s, shm=%s)",
         transport_type.name,
         torchcomms_uniflow_available(),
         torchcomms_rdma_available(),
+        rdma4py_transport_available(),
         monarch_rdma_transport_available(),
         gloo_available(),
         SHM_ENABLED and is_local_to_volume(storage_volume_ref),
     )
 
 
-def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> TransportBuffer:
-    transport_type = storage_volume_ref.default_transport_type
-
-    if transport_type == TransportType.Unset:
-        transport_type = get_available_transport(storage_volume_ref)
+def create_transport_buffer(
+    storage_volume_ref: "StorageVolumeRef",
+    transport_type: TransportType | None = None,
+) -> TransportBuffer:
+    if transport_type is None:
+        transport_type = storage_volume_ref.default_transport_type
+        if transport_type == TransportType.Unset:
+            transport_type = get_available_transport(storage_volume_ref)
 
     _log_transport_resolution(storage_volume_ref, transport_type)
 
@@ -101,6 +122,7 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
     transport_map = {
         TransportType.MonarchRPC: MonarchRPCTransportBuffer,
         TransportType.MonarchRDMA: MonarchRDMATransportBuffer,
+        TransportType.Rdma4Py: Rdma4PyTransportBuffer,
         TransportType.Gloo: GlooTransportBuffer,
         TransportType.SharedMemory: SharedMemoryTransportBuffer,
     }

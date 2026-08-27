@@ -279,6 +279,30 @@ await ts.put_state_dict(model.state_dict(), "policy", direct_rdma=True)
 await ts.get_state_dict("policy", user_state_dict=model.state_dict(), direct_rdma=True)
 ```
 
+Direct weight sync uses the transport configured on the TorchStore strategy.
+For example, select direct rdma4py once during initialization:
+
+```python
+from torchstore.transport import TransportType
+
+await ts.initialize(
+    num_storage_volumes=N,
+    strategy=ts.LocalRankStrategy(
+        default_transport_type=TransportType.Rdma4Py,
+    ),
+)
+await ts.put_state_dict(model.state_dict(), "policy", direct_rdma=True)
+await ts.get_state_dict(
+    "policy", user_state_dict=model.state_dict(), direct_rdma=True
+)
+```
+
+Use `TransportType.TorchComms` or `TransportType.MonarchRDMA` for the other
+direct backends. With `TransportType.Unset`, TorchStore selects the first
+available RDMA transport using the same priority as normal transfers. Gloo,
+shared memory, and RPC transports cannot be used with `direct_rdma=True`
+because they do not provide one-sided GPU reads.
+
 `transfer_dtype` can cast weights for transfer (e.g. float32 master weights
 transferred as bfloat16).
 
@@ -290,10 +314,18 @@ configuration is needed — the selection happens at runtime:
 | Priority | Transport | When used |
 |----------|-----------|-----------|
 | 1 | **POSIX Shared Memory** | Client and storage volume are on the same host |
-| 2 | **Monarch RDMA** | Cross-host, `monarch.rdma` available |
-| 3 | **TorchComms RDMA** | Cross-host, `torchcomms` installed |
-| 4 | **Gloo** | Cross-host fallback via collective transport |
-| 5 | **Monarch RPC** | Universal fallback, always available |
+| 2 | **TorchComms** | Cross-host, `uniflow` or `torchcomms` RDMA available |
+| 3 | **rdma4py** | Cross-host, `ibverbs` installed and an active RC device available |
+| 4 | **Monarch RDMA** | Cross-host, `monarch.rdma` available |
+| 5 | **Gloo** | Cross-host fallback via collective transport |
+| 6 | **Monarch RPC** | Universal fallback, always available |
+
+Install the rdma4py backend with `pip install 'torchstore[rdma4py]'` and select
+it explicitly with `TransportType.Rdma4Py`. The backend recognizes
+`TORCHSTORE_RDMA4PY_DEVICE`, `TORCHSTORE_RDMA4PY_PORT`, and
+`TORCHSTORE_RDMA4PY_GID_INDEX` for HCA/path selection. For GPUDirect CUDA
+buffers, set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` before importing
+PyTorch so rdma4py can use its dma-buf registration path.
 
 To force a specific transport, pass `default_transport_type` when constructing a
 strategy:

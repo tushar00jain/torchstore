@@ -36,10 +36,11 @@ class TrieKeysView(KeysView[str]):
 
     def filter_by_prefix(self, prefix: str) -> list[str]:
         """Return a list of keys that start with the given prefix."""
-        try:
-            return [str(key) for key in self._trie.iterkeys(prefix=prefix)]
-        except KeyError:
-            return []
+        # pygtrie's ``prefix=`` matches separator-delimited trie components,
+        # not an ordinary string prefix. TorchStore keys use several delimiters
+        # (notably ``/`` for direct-RDMA control records), so implement the
+        # documented lexical-prefix behavior explicitly.
+        return [str(key) for key in self._trie if str(key).startswith(prefix)]
 
 
 class Trie(MutableMapping[str, Any]):

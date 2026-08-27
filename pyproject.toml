@@ -24,7 +24,7 @@ dependencies = [
     "pygtrie",
     "portpicker",
     "torch",
-    "torchmonarch==0.4.1",
+    "torchmonarch>=0.7.0.dev20260820,<0.8",
 ] #todo: add toml
 
 [project.urls]
@@ -32,6 +32,9 @@ dependencies = [
 "Bug Tracker" = "https://github.com/meta-pytorch/torchstore/issues"
 
 [project.optional-dependencies]
+rdma4py = [
+    "ibverbs>=0.1.0 ; sys_platform == 'linux'",
+]
 cu128 = [
     # torchcomms wheels are CUDA-specific and depend on the matching torch wheel.
     "torch==2.11.0",

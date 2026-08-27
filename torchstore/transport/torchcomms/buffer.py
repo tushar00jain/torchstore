@@ -11,6 +11,7 @@ from typing import Any, TYPE_CHECKING
 
 import torch
 
+from torchstore.direct_transport import DirectTransport
 from torchstore.transport.buffers import TransportBuffer
 from torchstore.transport.torchcomms.cache import RdmaMemoryCache, RdmaTransportCache
 from torchstore.transport.types import Request
@@ -54,6 +55,62 @@ class RdmaContext:
         state["rdma_memory"] = None
         state["tensor_ref"] = None
         return state
+
+
+class _TorchCommsDirectPeer:
+    """Per-peer state owned by :class:`TorchCommsDirectTransport`."""
+
+    def __init__(
+        self,
+        device: torch.device,
+        remote_info: bytes | None = None,
+    ) -> None:
+        self._transport_cache = RdmaTransportCache()
+        self._memory_cache = RdmaMemoryCache()
+        self._transport, self._connection_info = self._transport_cache.put(
+            "direct", device
+        )
+        if remote_info is not None:
+            self.connect(remote_info)
+
+    @property
+    def connection_info(self) -> bytes:
+        return self._connection_info
+
+    def register(self, tensor: torch.Tensor) -> Any:
+        return self._memory_cache.get_or_register(tensor).to_remote_buffer()
+
+    def connect(self, remote_info: bytes) -> None:
+        result = self._transport.connect(remote_info)
+        if result != 0:
+            self.close()
+            raise RuntimeError(f"TorchComms RDMA connect failed: {result}")
+
+    async def read_into(self, remote_buffer: Any, tensor: torch.Tensor) -> None:
+        memory = self._memory_cache.get_or_register(tensor)
+        result = self._transport.read(memory.to_mutable_view(), remote_buffer)
+        if result != 0:
+            raise RuntimeError(f"TorchComms RDMA read failed: {result}")
+
+    def close(self) -> None:
+        self._memory_cache.clear()
+        self._transport_cache.clear()
+        self._transport = None
+
+
+class TorchCommsDirectTransport(DirectTransport):
+    """Direct TorchComms transport for source and destination roles."""
+
+    def __init__(self, store: Any, key: str) -> None:
+        from torchstore.transport import TransportType
+
+        super().__init__(store, key, TransportType.TorchComms)
+
+    def create_source_connection(self, connection_info, device):
+        return _TorchCommsDirectPeer(device, connection_info)
+
+    def create_destination_connection(self, device):
+        return _TorchCommsDirectPeer(device)
 
 
 class TorchCommsRdmaTransportBuffer(TransportBuffer):
