@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import math
 from collections import defaultdict
 from logging import getLogger
 from typing import Any
@@ -13,7 +14,7 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from torchstore.controller import ObjectType
-from torchstore.logging import LatencyTracker
+from torchstore.logging import LatencyTracker, record_observation
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer, Request, TensorSlice
 from torchstore.utils import (
@@ -175,6 +176,7 @@ class LocalClient:
                 results[req.key], inplace_dict.get(req.key), req
             )
 
+        latency_tracker.track_step("apply_inplace")
         latency_tracker.track_e2e()
         return final_results
 
@@ -216,8 +218,10 @@ class LocalClient:
         Returns:
             dict mapping each key to its raw fetched data (before inplace copy-back).
         """
+        tracker = LatencyTracker("fetch")
         keys = [r.key for r in requests]
         volume_maps = await self._locate_volumes(keys)
+        tracker.track_step("locate_volumes")
         all_volume_ids: set[str] = {vid for vm in volume_maps.values() for vid in vm}
 
         # eagerly make transport buffers for all volumes
@@ -228,17 +232,71 @@ class LocalClient:
                 storage_volume_ref,
                 self.strategy.get_transport_type(storage_volume_ref),
             )
+        tracker.track_step("create_transport_buffers")
 
         # collect the requests for each volume
         volume_requests, whole_keys = self._build_volume_requests(
             requests, volume_maps, transport_buffer_map
         )
+        tracker.track_step("plan_requests")
+
+        planned_requests = [
+            request
+            for requests_for_volume in volume_requests.values()
+            for request in requests_for_volume
+        ]
+        payload_bytes = sum(
+            request.tensor_val.numel() * request.tensor_val.element_size()
+            for request in requests
+            if request.tensor_val is not None
+        )
+        element_sizes = {
+            request.key: request.tensor_val.element_size()
+            for request in requests
+            if request.tensor_val is not None
+        }
+        planned_sizes = [
+            (
+                request.tensor_val.numel() * request.tensor_val.element_size()
+                if request.tensor_val is not None
+                else math.prod(request.tensor_slice.local_shape)
+                * element_sizes[request.key]
+            )
+            for request in planned_requests
+            if request.tensor_val is not None
+            or (
+                request.tensor_slice is not None
+                and request.key in element_sizes
+            )
+        ]
+        planned_bytes = sum(planned_sizes)
+        record_observation("fetch/request_count", len(requests))
+        record_observation("fetch/source_volume_count", len(all_volume_ids))
+        record_observation("fetch/transport_batch_count", len(volume_requests))
+        record_observation("fetch/planned_request_count", len(planned_requests))
+        record_observation("fetch/payload_bytes", payload_bytes)
+        record_observation("fetch/planned_transfer_bytes", planned_bytes)
+        if payload_bytes:
+            record_observation(
+                "fetch/transfer_amplification", planned_bytes / payload_bytes
+            )
+        if planned_sizes:
+            record_observation(
+                "fetch/planned_request_bytes_mean",
+                planned_bytes / len(planned_sizes),
+            )
+            record_observation("fetch/planned_request_bytes_min", min(planned_sizes))
+            record_observation("fetch/planned_request_bytes_max", max(planned_sizes))
 
         # fetch (request, volume_result) pairs from all volumes in parallel
         fetch_pairs = await self._fetch_results(volume_requests, transport_buffer_map)
+        tracker.track_step("transport")
 
         # assemble final results
-        return self._assemble_results(requests, fetch_pairs, whole_keys)
+        results = self._assemble_results(requests, fetch_pairs, whole_keys)
+        tracker.track_step("assemble")
+        tracker.track_e2e()
+        return results
 
     def _build_volume_requests(
         self,

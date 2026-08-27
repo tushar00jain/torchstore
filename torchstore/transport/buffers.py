@@ -242,11 +242,14 @@ class TransportBuffer:
             await self._pre_get_hook(requests)
             l.track_step("_pre_get_hook")
 
-            response = await self._handle_storage_volume_response(
-                requests,
-                await self.storage_volume_ref.volume.get.call_one(self, meta_requests),
+            storage_response = await self.storage_volume_ref.volume.get.call_one(
+                self, meta_requests
             )
             l.track_step("volume.get.call")
+            response = await self._handle_storage_volume_response(
+                requests, storage_response
+            )
+            l.track_step("handle_storage_volume_response")
 
             await self._post_request_success()
             l.track_step("_post_request_success")

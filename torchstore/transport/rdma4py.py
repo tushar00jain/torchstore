@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import uuid
 import weakref
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 from torchstore.direct_transport import DirectTransport
+from torchstore.logging import record_observation
 from torchstore.transport.buffers import TransportBuffer, TransportCache
 from torchstore.transport.types import Request
 
@@ -404,10 +406,17 @@ class Rdma4PyConnectionCache(TransportCache):
         key = (id(endpoint.pd), tensor.data_ptr(), nbytes, int(access))
         registration = self._registrations.get(key)
         if registration is not None:
+            record_observation("rdma4py/registration_cache_hit", 1)
             return registration
         if endpoint.factory is None:
             raise RuntimeError("rdma4py endpoint is closed")
+        record_observation("rdma4py/registration_cache_miss", 1)
+        start = time.perf_counter()
         registration = _register_tensor(endpoint.factory, tensor, access)
+        record_observation(
+            "rdma4py/register_tensor/seconds", time.perf_counter() - start
+        )
+        record_observation("rdma4py/register_tensor/bytes", nbytes)
         self._registrations[key] = registration
         self._storage_refs[key] = weakref.ref(
             tensor.untyped_storage(), lambda _ref, _key=key: self._evict(_key)
