@@ -12,6 +12,7 @@ from typing import Any
 import torch
 from torch.distributed.tensor import DTensor
 
+from torchstore import coverage
 from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
 from torchstore.strategy import TorchStoreStrategy
@@ -38,14 +39,18 @@ class LocalClient:
         self,
         controller,
         strategy,
+        prefer: tuple[str, ...] | None = None,
     ):
         self._controller = controller
         self.strategy: TorchStoreStrategy = strategy
+        self._prefer = prefer
 
     async def _locate_volumes(self, keys: list[str]):
         """Helper method to call locate_volumes and convert any error to KeyError for missing keys."""
         try:
-            return await self._controller.locate_volumes.call_one(keys)
+            return await self._controller.locate_volumes.call_one(
+                keys, prefer=self._prefer
+            )
         except Exception as e:
             raise KeyError(str(e)) from e
 
@@ -86,6 +91,7 @@ class LocalClient:
         await self._controller.notify_put_batch.call(
             [r.meta_only() for r in requests],
             storage_volume_ref.volume_id,
+            pending=False,
         )
         latency_tracker.track_step("notify_put_batch")
         latency_tracker.track_e2e()
@@ -241,6 +247,7 @@ class LocalClient:
         requests: list[Request],
         volume_maps: dict[str, dict],
         transport_buffer_map: dict,
+        covered: set | None = None,
     ) -> tuple[dict[str, list[Request]], set[str]]:
         """Expand per-key requests into per-volume request lists.
 
@@ -250,6 +257,14 @@ class LocalClient:
         """
         volume_requests: dict[str, list[Request]] = defaultdict(list)
         whole_keys: set[str] = set()
+        chosen = set(
+            coverage.cover(
+                requests,
+                volume_maps,
+                set() if covered is None else set(covered),
+            )
+        )
+        request_covered = set() if covered is None else covered
 
         for request in requests:
             volume_map = volume_maps[request.key]
@@ -264,6 +279,8 @@ class LocalClient:
             )
 
             for volume_id, storage_info in volume_map.items():
+                if volume_id not in chosen:
+                    continue
                 if storage_info.object_type == ObjectType.OBJECT:
                     volume_requests[volume_id].append(
                         Request(key=request.key, is_object=True)
@@ -275,9 +292,22 @@ class LocalClient:
                     whole_keys.add(request.key)
                     break
                 else:
-                    volume_requests[volume_id].extend(
-                        self._expand_tensor_slices(request, storage_info, use_inplace)
+                    parts = self._expand_tensor_slices(
+                        request, storage_info, use_inplace
                     )
+                    fresh = [
+                        part
+                        for part in parts
+                        if coverage._region(part.key, part.tensor_slice)
+                        not in request_covered
+                    ]
+                    if not fresh:
+                        continue
+                    request_covered.update(
+                        coverage._region(part.key, part.tensor_slice)
+                        for part in fresh
+                    )
+                    volume_requests[volume_id].extend(fresh)
 
         return dict(volume_requests), whole_keys
 
