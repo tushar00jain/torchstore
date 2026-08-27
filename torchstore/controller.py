@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import warnings
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import auto, Enum
 from itertools import product
@@ -47,16 +47,42 @@ class StorageInfo:
         self.tensor_slices.update(other_storage_info.tensor_slices)
 
 
+_ShapeEntry = tuple[str, ObjectType, frozenset[TensorSlice | None]]
+_Shape = tuple[_ShapeEntry, ...]
+
+
+@dataclass
+class _Publication:
+    volume: str
+    keys: frozenset[str]
+    shape: _Shape
+
+
+# Publication identity: the store's own name for "a pub id on a volume".
+# pub_id == 0: the volume holds a live entry (already landed sentinel)
+# pub_id > 0: an outstanding publication on the volume
+Publication = tuple[int, str]
+
+
+def _live_view(
+    volume_map: dict[str, dict[int, StorageInfo]],
+) -> dict[str, StorageInfo]:
+    return {volume: slot[0] for volume, slot in volume_map.items() if 0 in slot}
+
+
 class Controller(Actor):
     def __init__(
         self,
     ) -> None:
-        self.keys_to_storage_volumes = Trie()
+        self.keys_to_storage_volumes: Trie = Trie()
         self.is_initialized: bool = False
         self.strategy: TorchStoreStrategy | None = None
         self.storage_volumes: StorageVolume | None = None
         self.num_storage_volumes: int | None = None
         self.strategy: TorchStoreStrategy | None = None
+        self._next_pub = 1
+        self._publications: dict[int, _Publication] = {}
+        self._shape_pubs: dict[_Shape, set[int]] = {}
 
     def assert_initialized(self) -> None:
         assert (
@@ -84,6 +110,8 @@ class Controller(Actor):
         all_slices = set()
         mesh_shape = None
 
+        if not volume_map:
+            return False
         for storage_info in volume_map.values():
             if storage_info.object_type != ObjectType.TENSOR_SLICE:
                 return True  # Not a DTensor, so it's "fully committed"
@@ -141,6 +169,7 @@ class Controller(Actor):
         keys: list[str],
         missing_ok: bool = False,
         require_fully_committed: bool = True,
+        prefer: Sequence[str] | None = None,
     ) -> dict[str, dict[str, StorageInfo]]:
         """Locate storage volumes containing shards of the specified keys.
 
@@ -176,6 +205,16 @@ class Controller(Actor):
                 missing_ok is False, or if a key is a DTensor that is only
                 partially committed and require_fully_committed is True.
         """
+        return self._locate(keys, missing_ok, require_fully_committed, prefer=prefer)
+
+    def _locate(
+        self,
+        keys: Sequence[str],
+        missing_ok: bool = False,
+        require_fully_committed: bool = True,
+        *,
+        prefer: Sequence[str] | None = None,
+    ) -> dict[str, dict[str, StorageInfo]]:
         self.assert_initialized()
         result = {}
         for key in keys:
@@ -183,7 +222,11 @@ class Controller(Actor):
                 if missing_ok:
                     continue
                 raise KeyError(f"Unable to locate {key} in any storage volumes.")
-            volume_map = self.keys_to_storage_volumes[key]
+            volume_map = _live_view(self.keys_to_storage_volumes[key])
+            if not volume_map:
+                if missing_ok:
+                    continue
+                raise KeyError(f"Unable to locate {key} in any storage volumes.")
             if require_fully_committed and not self._is_dtensor_fully_committed(
                 key, volume_map
             ):
@@ -192,7 +235,7 @@ class Controller(Actor):
                     f"Not all shards have been stored yet. "
                     f"Please ensure all ranks complete their put() operations."
                 )
-            result[key] = volume_map
+            result[key] = self._prefer(volume_map, prefer)
         return result
 
     @endpoint
@@ -200,7 +243,9 @@ class Controller(Actor):
         self,
         requests: list[Request],
         storage_volume_id: str,
-    ) -> None:
+        *,
+        pending: bool = True,
+    ) -> int:
         """Notify the controller that data has been stored in a storage volume.
 
         This should called after a successful put operation to
@@ -210,34 +255,76 @@ class Controller(Actor):
             requests: List of Requests (meta-only, no tensor data).
             storage_volume_id: ID of the storage volume where the data was stored.
         """
+        return self._notify_put_batch(requests, storage_volume_id, pending=pending)
+
+    def _notify_put_batch(
+        self,
+        requests: Sequence[Request],
+        storage_volume_id: str,
+        *,
+        pending: bool = True,
+    ) -> int:
         self.assert_initialized()
+        pub = self._allocate_publication() if pending else 0
+        grouped = self._group_requests(requests)
+        if pending:
+            for key, info in grouped.items():
+                self._slot(key, storage_volume_id)[pub] = info
+            shape = self._shape(grouped)
+            shape_pubs = self._shape_pubs.get(shape)
+            if shape_pubs is None:
+                shape_pubs = set()
+                self._shape_pubs[shape] = shape_pubs
+            else:
+                shape = next(
+                    indexed for indexed in self._shape_pubs if indexed == shape
+                )
+            grouped.clear()
+            self._publications[pub] = _Publication(
+                storage_volume_id,
+                frozenset(entry[0] for entry in shape),
+                shape,
+            )
+            shape_pubs.add(pub)
+        else:
+            for key, info in grouped.items():
+                self._put_live_info(key, info, storage_volume_id)
+        return pub
 
-        for request in requests:
-            self._notify_put(request, storage_volume_id)
-
-    def _notify_put(self, request: Request, storage_volume_id: str) -> None:
+    def _notify_put(
+        self,
+        request: Request,
+        storage_volume_id: str,
+        *,
+        pending: bool = True,
+    ) -> int:
         assert (
             request.tensor_val is None
         ), "request should not contain tensor data, as this will significantly increase e2e latency"
-
-        key = request.key
-        if key not in self.keys_to_storage_volumes:
-            self.keys_to_storage_volumes[key] = {}
-
-        storage_info = StorageInfo(
-            object_type=ObjectType.from_request(request),
-            tensor_slices={request.tensor_slice},
+        return self._notify_put_batch(
+            [request], storage_volume_id, pending=pending
         )
 
-        if storage_volume_id not in self.keys_to_storage_volumes[key]:
-            self.keys_to_storage_volumes[key][storage_volume_id] = storage_info
+    def _put_live_info(
+        self,
+        key: str,
+        info: StorageInfo,
+        storage_volume_id: str,
+    ) -> None:
+        slot = self._slot(key, storage_volume_id)
+        held = slot.get(0)
+        if held is None:
+            slot[0] = info
         else:
-            self.keys_to_storage_volumes[key][storage_volume_id].update(storage_info)
+            held.update(info)
 
     @endpoint
     async def teardown(self) -> None:
         self.is_initialized = False
         self.keys_to_storage_volumes = Trie()
+        self._next_pub = 1
+        self._publications.clear()
+        self._shape_pubs.clear()
         self.strategy = None
         # StorageVolume in ControllerStrategy can be reused because it was spawned with get_or_spawn_controller.
         # So we have to reset it, otherwise new TensorSlice values for the same key will get piled up in the set.
@@ -248,9 +335,19 @@ class Controller(Actor):
 
     @endpoint
     async def keys(self, prefix=None) -> list[str]:
-        if prefix is None:
-            return list(self.keys_to_storage_volumes.keys())
-        return self.keys_to_storage_volumes.keys().filter_by_prefix(prefix)
+        return self._keys(prefix)
+
+    def _keys(self, prefix=None) -> list[str]:
+        candidates = (
+            list(self.keys_to_storage_volumes.keys())
+            if prefix is None
+            else self.keys_to_storage_volumes.keys().filter_by_prefix(prefix)
+        )
+        return [
+            key
+            for key in candidates
+            if _live_view(self.keys_to_storage_volumes[key])
+        ]
 
     @endpoint
     async def notify_delete(self, key: str, storage_volume_id: str) -> None:
@@ -274,23 +371,191 @@ class Controller(Actor):
             if missing_ok:
                 return
             raise KeyError(f"Unable to locate {key} in any storage volumes.")
-        if storage_volume_id not in self.keys_to_storage_volumes[key]:
+        volume_map = self.keys_to_storage_volumes[key]
+        slot = volume_map.get(storage_volume_id)
+        if slot is None or 0 not in slot:
             if missing_ok:
                 return
             raise KeyError(
                 f"Unable to locate {key} in storage volume {storage_volume_id}."
             )
-        del self.keys_to_storage_volumes[key][storage_volume_id]
-        if len(self.keys_to_storage_volumes[key]) == 0:
-            del self.keys_to_storage_volumes[key]
+        del slot[0]
+        self._cleanup_slot(key, storage_volume_id)
 
     @endpoint
-    async def notify_delete_batch(self, volume_to_keys: dict[str, list[str]]) -> None:
+    async def notify_delete_batch(
+        self,
+        volume_to_keys: dict[str, list[str]] | None = None,
+        *,
+        pub: int | None = None,
+    ) -> None:
         """Notify the controller about an idempotent batch delete."""
         self.assert_initialized()
+        self._notify_delete_batch(volume_to_keys, pub=pub)
+
+    def _notify_delete_batch(
+        self,
+        volume_to_keys: dict[str, list[str]] | None = None,
+        *,
+        pub: int | None = None,
+    ) -> None:
+        if pub is not None:
+            self._retire(pub)
+            return
+        if volume_to_keys is None:
+            return
         for storage_volume_id, keys in volume_to_keys.items():
             for key in keys:
                 self._notify_delete(key, storage_volume_id, missing_ok=True)
 
-    def get_keys_to_storage_volumes(self) -> Mapping[str, dict[str, StorageInfo]]:
+    def serving_union(
+        self, requests: Sequence[Request]
+    ) -> frozenset[Publication]:
+        """Live and pending sources overlapping any requested region."""
+        from torchstore import coverage
+
+        wanted = self._group_requests(requests)
+        sources: set[Publication] = set()
+        for key, request_info in wanted.items():
+            for volume, slot in self.keys_to_storage_volumes.get(key, {}).items():
+                info = slot.get(0)
+                if info is not None and coverage._overlaps(request_info, info):
+                    sources.add((0, volume))
+        for shape, shape_pubs in self._shape_pubs.items():
+            if self._same_shape(shape, wanted):
+                for pub in shape_pubs:
+                    sources.add((pub, self._publications[pub].volume))
+                continue
+            for entry_key, object_type, tensor_slices in shape:
+                request_info = wanted.get(entry_key)
+                if request_info is None:
+                    continue
+                if not coverage._overlaps(
+                    request_info, StorageInfo(object_type, set(tensor_slices))
+                ):
+                    continue
+                for pub in shape_pubs:
+                    sources.add((pub, self._publications[pub].volume))
+                break
+        return frozenset(sources)
+
+    def greedy_cover(
+        self,
+        requests: Sequence[Request],
+        ranked: Iterable[Publication],
+    ) -> list[Publication]:
+        """Per-key/per-slice cover over ranked live and pending sources."""
+        from torchstore import coverage
+
+        source_maps: dict[str, dict[Publication, StorageInfo]] = {
+            request.key: {} for request in requests
+        }
+        wanted = self._group_requests(requests)
+        remaining = dict.fromkeys(source_maps)
+        for source in ranked:
+            pub, volume = source
+            publication = None if pub == 0 else self._publications.get(pub)
+            if publication is not None and publication.volume != volume:
+                publication = None
+            for key in tuple(remaining):
+                slot = self.keys_to_storage_volumes.get(key, {}).get(volume, {})
+                info = slot.get(pub) if pub == 0 or publication is not None else None
+                if info is None or not coverage._overlaps(wanted[key], info):
+                    continue
+                source_maps[key][source] = info
+                if info.object_type is not ObjectType.TENSOR_SLICE:
+                    del remaining[key]
+            if not remaining:
+                break
+        return coverage.cover(requests, source_maps)
+
+    def _allocate_publication(self) -> int:
+        # Publication 0 is the terminal sentinel for a live source.
+        pub = self._next_pub
+        self._next_pub += 1
+        return pub
+
+    @staticmethod
+    def _group_requests(requests: Sequence[Request]) -> dict[str, StorageInfo]:
+        grouped: dict[str, StorageInfo] = {}
+        for request in requests:
+            assert request.tensor_val is None, (
+                "request should not contain tensor data, as this will significantly "
+                "increase e2e latency"
+            )
+            info = StorageInfo(
+                ObjectType.from_request(request), {request.tensor_slice}
+            )
+            held = grouped.get(request.key)
+            if held is None:
+                grouped[request.key] = info
+            else:
+                held.update(info)
+        return grouped
+
+    @staticmethod
+    def _shape(rows: Mapping[str, StorageInfo]) -> _Shape:
+        return tuple(
+            (key, info.object_type, frozenset(info.tensor_slices))
+            for key, info in rows.items()
+        )
+
+    @staticmethod
+    def _same_shape(shape: _Shape, rows: Mapping[str, StorageInfo]) -> bool:
+        if len(shape) != len(rows):
+            return False
+        return all(
+            key == row_key
+            and object_type is info.object_type
+            and tensor_slices == info.tensor_slices
+            for (key, object_type, tensor_slices), (row_key, info) in zip(
+                shape, rows.items()
+            )
+        )
+
+    def _slot(self, key: str, volume: str) -> dict[int, StorageInfo]:
+        if key not in self.keys_to_storage_volumes:
+            self.keys_to_storage_volumes[key] = {}
+        return self.keys_to_storage_volumes[key].setdefault(volume, {})
+
+    def _cleanup_slot(self, key: str, volume: str) -> None:
+        volume_map = self.keys_to_storage_volumes.get(key)
+        if volume_map is None:
+            return
+        slot = volume_map.get(volume)
+        if slot:
+            return
+        volume_map.pop(volume, None)
+        if not volume_map:
+            del self.keys_to_storage_volumes[key]
+
+    def _retire(self, pub: int) -> None:
+        publication = self._publications.get(pub)
+        if publication is None:
+            return
+        for key in publication.keys:
+            slot = self.keys_to_storage_volumes.get(key, {}).get(
+                publication.volume
+            )
+            if slot is not None:
+                slot.pop(pub, None)
+                self._cleanup_slot(key, publication.volume)
+        pubs = self._shape_pubs[publication.shape]
+        pubs.discard(pub)
+        if not pubs:
+            del self._shape_pubs[publication.shape]
+        del self._publications[pub]
+
+    @staticmethod
+    def _prefer(
+        volumes: dict[str, StorageInfo], prefer: Sequence[str] | None
+    ) -> dict[str, StorageInfo]:
+        if prefer is None:
+            return volumes
+        ranked = {volume: volumes[volume] for volume in prefer if volume in volumes}
+        return ranked if ranked else volumes
+
+    def get_keys_to_storage_volumes(
+        self,
+    ) -> Mapping[str, dict[str, dict[int, StorageInfo]]]:
         return self.keys_to_storage_volumes

@@ -32,6 +32,7 @@ from torchstore.strategy import (
     MultiMeshStrategy,
     TorchStoreStrategy,
 )
+from torchstore.controller import Publication
 
 initialize_spmd = spmd.initialize
 
@@ -65,6 +66,7 @@ __all__ = [
     "MultiMeshStrategy",
     "HostStrategy",
     "ControllerStorageVolumes",
+    "Publication",
     "put_state_dict",
     "get_state_dict",
     "reset_client",

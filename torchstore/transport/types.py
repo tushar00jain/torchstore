@@ -36,8 +36,16 @@ class TensorSlice:
     mesh_shape: tuple
 
     def __post_init__(self):
-        if self.coordinates is not None:
-            self.coordinates = tuple(self.coordinates)
+        for name in (
+            "offsets",
+            "coordinates",
+            "global_shape",
+            "local_shape",
+            "mesh_shape",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(self, name, tuple(value))
 
     def __hash__(self):
         return hash(
