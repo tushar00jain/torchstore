@@ -492,6 +492,45 @@ class TestTorchCommsSelection:
             == TransportType.TorchComms
         )
 
+    def test_get_available_transport_uses_rdma4py_before_monarch(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(transport_module, "SHM_ENABLED", False)
+        monkeypatch.setattr(
+            transport_module, "torchcomms_uniflow_available", lambda: False
+        )
+        monkeypatch.setattr(
+            transport_module, "torchcomms_rdma_available", lambda: False
+        )
+        monkeypatch.setattr(
+            transport_module, "rdma4py_transport_available", lambda: True
+        )
+        monkeypatch.setattr(
+            transport_module, "monarch_rdma_transport_available", lambda: True
+        )
+
+        assert (
+            transport_module.get_available_transport(_storage_volume_ref())
+            == TransportType.Rdma4Py
+        )
+
+    def test_create_explicit_rdma4py_transport(self, monkeypatch) -> None:
+        class FakeRdma4PyTransportBuffer:
+            def __init__(self, storage_volume_ref) -> None:
+                self.storage_volume_ref = storage_volume_ref
+
+        monkeypatch.setattr(
+            transport_module,
+            "Rdma4PyTransportBuffer",
+            FakeRdma4PyTransportBuffer,
+        )
+        ref = _storage_volume_ref(default_transport_type=TransportType.Rdma4Py)
+
+        buffer = transport_module.create_transport_buffer(ref)
+
+        assert isinstance(buffer, FakeRdma4PyTransportBuffer)
+        assert buffer.storage_volume_ref is ref
+
     def test_create_transport_buffer_rejects_missing_torchcomms(
         self, monkeypatch
     ) -> None:

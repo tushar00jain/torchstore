@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,10 +27,7 @@ logger = logging.getLogger(__name__)
 class _DirectRDMACache:
     """Per-client cache for direct RDMA weight sync state."""
 
-    source: Any = None  # DirectWeightSyncSource, lazily created
-    dest: Any = None  # DirectWeightSyncDest, lazily created
-    registered: set = field(default_factory=set)
-    handles: dict = field(default_factory=dict)
+    transports: dict = field(default_factory=dict)
 
 
 _rdma_cache: dict[int, _DirectRDMACache] = {}
@@ -46,7 +42,11 @@ def _get_rdma_cache(store) -> _DirectRDMACache:
 
 
 async def put_state_dict(
-    store, state_dict, key, direct_rdma=False, transfer_dtype=None
+    store,
+    state_dict,
+    key,
+    direct_rdma=False,
+    transfer_dtype=None,
 ):
     """Store a state dict in TorchStore.
 
@@ -70,13 +70,23 @@ async def put_state_dict(
     # Coarse weight-sync phase timing, logged at INFO (no TORCHSTORE_LOG_LEVEL
     # =DEBUG / init_logging() needed) so callers can attribute latency to the
     # major phases and compare the direct-RDMA vs CPU-staged transports.
+    direct_transport = (
+        store.strategy.get_direct_transport_type() if direct_rdma else None
+    )
+    direct_path = direct_transport.name if direct_transport is not None else None
     tracker = LatencyTracker(
-        f"put_state_dict[{key}]/{'rdma' if direct_rdma else 'cpu_staged'}",
+        f"put_state_dict[{key}]/{direct_path if direct_rdma else 'cpu_staged'}",
         level=logging.INFO,
     )
 
     if direct_rdma:
-        await _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype)
+        await _put_state_dict_direct_rdma(
+            store,
+            state_dict,
+            key,
+            transfer_dtype,
+            direct_transport,
+        )
         # No throughput here: the direct-RDMA put only registers handles (and on
         # repeat calls refreshes staging buffers). The bytes move on the
         # generator's get via one-sided RDMA read, so there is no bulk transfer
@@ -106,7 +116,11 @@ async def put_state_dict(
 
 
 async def get_state_dict(
-    store, key, user_state_dict: dict | None = None, strict=True, direct_rdma=False
+    store,
+    key,
+    user_state_dict: dict | None = None,
+    strict=True,
+    direct_rdma=False,
 ):
     """Retrieve a state dict from TorchStore.
 
@@ -119,8 +133,12 @@ async def get_state_dict(
     ``user_state_dict`` must be provided in this mode so the destination
     tensors are available for in-place writes.
     """
+    direct_transport = (
+        store.strategy.get_direct_transport_type() if direct_rdma else None
+    )
+    direct_path = direct_transport.name if direct_transport is not None else None
     tracker = LatencyTracker(
-        f"get_state_dict[{key}]/{'rdma' if direct_rdma else 'cpu_staged'}",
+        f"get_state_dict[{key}]/{direct_path if direct_rdma else 'cpu_staged'}",
         level=logging.INFO,
     )
 
@@ -128,7 +146,7 @@ async def get_state_dict(
         assert (
             user_state_dict is not None
         ), "user_state_dict is required for direct_rdma mode"
-        await _get_state_dict_direct_rdma(store, key, user_state_dict)
+        await _get_state_dict_direct_rdma(store, key, user_state_dict, direct_transport)
         # The direct-RDMA get is the actual GPU-to-GPU transfer, so report its
         # throughput (comparable to the CPU-staged get_batch GB/s).
         tracker.track_e2e(nbytes=_state_dict_nbytes(user_state_dict))
@@ -214,7 +232,9 @@ def _state_dict_size(state_dict):
 # ---------------------------------------------------------------------------
 
 
-async def _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype=None):
+async def _put_state_dict_direct_rdma(
+    store, state_dict, key, transfer_dtype, transport_type
+):
     """Register or refresh RDMA handles and publish via TorchStore.
 
     First call for a given key: registers RDMA handles for each param,
@@ -225,51 +245,40 @@ async def _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype=Non
     ``state_dict`` may be ``None`` to skip building it when only a refresh
     is needed.
     """
-    from torchstore.direct_weight_sync import DirectWeightSyncSource
-
     cache = _get_rdma_cache(store)
-
-    if cache.source is None:
-        cache.source = DirectWeightSyncSource()
-
-    if key not in cache.registered:
-        assert (
-            state_dict is not None
-        ), "state_dict is required on first put_state_dict call with direct_rdma=True"
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        handles = cache.source.register(
-            state_dict, rank=rank, transfer_dtype=transfer_dtype
-        )
-        await store.put(f"{key}/rank_{rank}", handles)
-        if rank == 0:
-            await store.put(f"{key}/num_ranks", world_size)
-        cache.registered.add(key)
-    else:
-        cache.source.refresh()
+    transport = _get_or_create_direct_transport(
+        cache, transport_type, store, key
+    )
+    await transport.put(
+        state_dict,
+        rank=dist.get_rank(),
+        world_size=dist.get_world_size(),
+        transfer_dtype=transfer_dtype,
+    )
 
 
-async def _get_state_dict_direct_rdma(store, key, user_state_dict):
+async def _get_state_dict_direct_rdma(
+    store, key, user_state_dict, transport_type
+):
     """Fetch RDMA handles and pull weights via direct RDMA reads.
 
     First call for a given key: fetches handles from TorchStore, caches them.
     Transfer plan is built on first pull and cached by DirectWeightSyncDest.
     All RDMA reads are issued concurrently for maximum throughput.
     """
-    from torchstore.direct_weight_sync import DirectWeightSyncDest
-
     cache = _get_rdma_cache(store)
+    transport = _get_or_create_direct_transport(
+        cache, transport_type, store, key
+    )
+    await transport.get(user_state_dict)
 
-    if cache.dest is None:
-        cache.dest = DirectWeightSyncDest()
 
-    if key not in cache.handles:
-        num_ranks = await store.get(f"{key}/num_ranks")
-        all_handles = defaultdict(list)
-        for r in range(num_ranks):
-            rank_handles = await store.get(f"{key}/rank_{r}")
-            for name, handle in rank_handles.items():
-                all_handles[name].append(handle)
-        cache.handles[key] = all_handles
+def _get_or_create_direct_transport(cache, transport_type, store, key):
+    from torchstore.direct_transport import create_direct_transport
 
-    await cache.dest.pull(cache.handles[key], user_state_dict)
+    cache_key = (key, transport_type)
+    transport = cache.transports.get(cache_key)
+    if transport is None:
+        transport = create_direct_transport(transport_type, store, key)
+        cache.transports[cache_key] = transport
+    return transport

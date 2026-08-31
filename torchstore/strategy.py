@@ -17,7 +17,11 @@ from typing import TYPE_CHECKING
 
 from monarch.actor import current_rank
 
-from torchstore.transport import TransportType
+from torchstore.transport import (
+    TransportType,
+    get_available_direct_transport,
+    get_available_transport,
+)
 from torchstore.transport.buffers import TransportContext
 
 if TYPE_CHECKING:
@@ -76,6 +80,38 @@ class TorchStoreStrategy:
             len(self.storage_volumes) if self.storage_volumes is not None else 0
         )
         return f"{self.__class__.__name__}(storage_volume_len={storage_vol_len})"
+
+    def get_transport_type(
+        self, storage_volume_ref: StorageVolumeRef
+    ) -> TransportType:
+        """Resolve the transport for normal client-to-StorageVolume transfers."""
+        if self.default_transport_type == TransportType.Unset:
+            return get_available_transport(storage_volume_ref)
+        return self.default_transport_type
+
+    def get_direct_transport_type(self) -> TransportType:
+        """Resolve the transport for direct GPU-to-GPU weight synchronization."""
+        transport_type = self.default_transport_type
+        if transport_type == TransportType.Unset:
+            transport_type = get_available_direct_transport()
+            if transport_type is None:
+                raise RuntimeError("No direct RDMA transport is available")
+
+        direct_transports = {
+            TransportType.MonarchRDMA,
+            TransportType.Rdma4Py,
+            TransportType.TorchComms,
+        }
+        if transport_type not in direct_transports:
+            supported = ", ".join(
+                transport.name
+                for transport in sorted(direct_transports, key=lambda item: item.name)
+            )
+            raise ValueError(
+                f"Transport {transport_type.name} does not support direct weight sync; "
+                f"expected one of: {supported}"
+            )
+        return transport_type
 
     @classmethod
     def get_volume_id(cls):

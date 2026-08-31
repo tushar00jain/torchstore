@@ -31,10 +31,13 @@ Typical usage (RL trainer → generator weight sync):
 
 import asyncio
 import logging
+from collections import defaultdict
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
+from torchstore.direct_transport import DirectTransport
 from torchstore.transport.types import Request, TensorSlice
 from torchstore.utils import get_slice_intersection, to_byte_view
 
@@ -72,6 +75,41 @@ def _request_to_slice(req: Request, param: torch.Tensor) -> TensorSlice:
         local_shape=shape,
         mesh_shape=tuple(1 for _ in range(ndim)),
     )
+
+
+def _prepare_source_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    transfer_dtype: torch.dtype | None,
+    *,
+    stage_noncontiguous: bool,
+) -> tuple[
+    dict[str, torch.Tensor],
+    dict[str, TensorSlice],
+    dict[str, tuple[torch.Tensor, torch.Tensor]],
+]:
+    """Prepare source tensors, shard metadata, and refreshable staging buffers."""
+    tensors = {}
+    tensor_slices = {}
+    staging = {}
+    for name, value in state_dict.items():
+        request = Request.from_any(name, value)
+        local_tensor = request.tensor_val
+        tensor_slices[name] = _request_to_slice(request, value)
+        if transfer_dtype is not None:
+            tensor = local_tensor.to(transfer_dtype).contiguous()
+            staging[name] = (tensor, local_tensor)
+        elif local_tensor.is_contiguous():
+            tensor = local_tensor
+        elif stage_noncontiguous:
+            tensor = local_tensor.contiguous()
+            staging[name] = (tensor, local_tensor)
+        else:
+            raise AssertionError(
+                f"Expected contiguous tensor for key={name}, "
+                f"strides={local_tensor.stride()}"
+            )
+        tensors[name] = tensor
+    return tensors, tensor_slices, staging
 
 
 # ---------------------------------------------------------------------------
@@ -118,40 +156,27 @@ class DirectWeightSyncSource:
         """
         from monarch.rdma import RDMABuffer
 
+        tensors, tensor_slices, self._staging = _prepare_source_state_dict(
+            state_dict,
+            transfer_dtype,
+            stage_noncontiguous=False,
+        )
         handles: dict[str, RDMAWeightHandle] = {}
-        num_staged = 0
-
-        for name, param in state_dict.items():
-            # Use TorchStore's Request to extract local tensor + shard metadata
-            req = Request.from_any(name, param)
-            local_tensor = req.tensor_val
-            tensor_slice = _request_to_slice(req, param)
-
-            if transfer_dtype is not None:
-                # Always stage: cast to transfer dtype for RDMA transfer.
-                # refresh() will re-copy from the original source tensor.
-                buf_tensor = local_tensor.to(transfer_dtype).contiguous()
-                self._staging[name] = (buf_tensor, local_tensor)
-                num_staged += 1
-            else:
-                assert (
-                    local_tensor.is_contiguous()
-                ), f"Expected contiguous tensor for key={name}, strides={local_tensor.stride()}"
-                buf_tensor = local_tensor
-
+        for name, buf_tensor in tensors.items():
             # Register the contiguous buffer with RDMA
             rdma_buf = RDMABuffer(to_byte_view(buf_tensor))
 
             handles[name] = RDMAWeightHandle(
                 rdma_buffer=rdma_buf,
-                tensor_slice=tensor_slice,
+                tensor_slice=tensor_slices[name],
                 source_rank=rank,
             )
 
         self._handles = handles
         logger.info(
             f"Registered {len(handles)} RDMA handles "
-            f"({num_staged} staged, {len(handles) - num_staged} direct)"
+            f"({len(self._staging)} staged, "
+            f"{len(handles) - len(self._staging)} direct)"
         )
         return handles
 
@@ -348,3 +373,53 @@ class DirectWeightSyncDest:
             # op.recv_buffer[op.src_slices] extracts the overlap from the source
             # op.dest_tensor[op.dest_slices] targets where it goes in the dest
             op.dest_tensor[op.dest_slices].copy_(op.recv_buffer[op.src_slices])
+
+
+class MonarchDirectTransport(DirectTransport):
+    """Monarch implementation of the common direct-transport lifecycle."""
+
+    def __init__(self, store: Any, key: str) -> None:
+        super().__init__(store, key)
+        self._source = DirectWeightSyncSource()
+        self._destination = DirectWeightSyncDest()
+        self._registered = False
+        self._handles: dict[str, list[RDMAWeightHandle]] | None = None
+
+    async def put(
+        self,
+        state_dict: dict[str, torch.Tensor] | None,
+        *,
+        rank: int,
+        world_size: int,
+        transfer_dtype: torch.dtype | None,
+    ) -> None:
+        if self._registered:
+            self._source.refresh()
+            return
+        assert state_dict is not None, (
+            "state_dict is required on first put_state_dict call with "
+            "direct_rdma=True"
+        )
+        handles = self._source.register(
+            state_dict,
+            rank=rank,
+            transfer_dtype=transfer_dtype,
+        )
+        await self.store.put(f"{self.key}/rank_{rank}", handles)
+        if rank == 0:
+            await self.store.put(f"{self.key}/num_ranks", world_size)
+        self._registered = True
+
+    async def get(self, user_state_dict: dict[str, torch.Tensor]) -> None:
+        if self._handles is None:
+            num_ranks = await self.store.get(f"{self.key}/num_ranks")
+            handles = defaultdict(list)
+            for rank in range(num_ranks):
+                rank_handles = await self.store.get(f"{self.key}/rank_{rank}")
+                for name, handle in rank_handles.items():
+                    handles[name].append(handle)
+            self._handles = handles
+        await self._destination.pull(self._handles, user_state_dict)
+
+    async def close(self) -> None:
+        await self._source.cleanup()
