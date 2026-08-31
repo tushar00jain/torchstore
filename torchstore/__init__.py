@@ -24,7 +24,7 @@ from torchstore.api import (
     reset_client,
     shutdown,
 )
-from torchstore.logging import init_logging
+from torchstore.logging import collect_latencies, init_logging
 from torchstore.strategy import (
     ControllerStorageVolumes,
     HostStrategy,
@@ -48,6 +48,7 @@ __all__ = [
     "initialize",
     "initialize_spmd",
     "init_logging",
+    "collect_latencies",
     "put",
     "put_batch",
     "get",

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import uuid
 import weakref
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from typing import Any, cast, TYPE_CHECKING
 
 import torch
 
+from torchstore.logging import record_observation
 from torchstore.transport.buffers import TransportCache
 
 if TYPE_CHECKING:
@@ -167,10 +169,17 @@ class RdmaMemoryCache(TransportCache):
     def get_or_register(self, tensor: torch.Tensor) -> RdmaMemory:
         key = (tensor.data_ptr(), tensor.nbytes)
         if key in self._cache:
+            record_observation("torchcomms_rdma/registration_cache_hit", 1)
             return self._cache[key]
 
         assert _torchcomms_transport is not None
+        record_observation("torchcomms_rdma/registration_cache_miss", 1)
+        start = time.perf_counter()
         mem = cast("RdmaMemory", _torchcomms_transport.RdmaMemory(tensor))
+        record_observation(
+            "torchcomms_rdma/register_tensor/seconds", time.perf_counter() - start
+        )
+        record_observation("torchcomms_rdma/register_tensor/bytes", tensor.nbytes)
         self._cache[key] = mem
         self._storage_refs[key] = weakref.ref(
             tensor.untyped_storage(), lambda _ref, _k=key: self._evict(_k)
@@ -348,13 +357,20 @@ class UniflowCache(TransportCache):
         """Register tensor memory once and evict when its storage is freed."""
         key = (tensor.data_ptr(), tensor.nbytes)
         if key in self._registrations:
+            record_observation("torchcomms/registration_cache_hit", 1)
             return self._registrations[key]
 
+        record_observation("torchcomms/registration_cache_miss", 1)
         segment = uniflow_transport_module().Segment.from_tensor(tensor)
+        start = time.perf_counter()
         registered_segment = cast(
             "RegisteredSegment",
             factory.register_segment(segment).unwrap(),
         )
+        record_observation(
+            "torchcomms/register_tensor/seconds", time.perf_counter() - start
+        )
+        record_observation("torchcomms/register_tensor/bytes", tensor.nbytes)
         registration = UniflowRegistration(
             registered_segment=registered_segment,
             length=tensor.nbytes,
