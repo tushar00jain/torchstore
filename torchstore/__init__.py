@@ -29,6 +29,7 @@ from torchstore.strategy import (
     ControllerStorageVolumes,
     HostStrategy,
     LocalRankStrategy,
+    MultiMeshStrategy,
     TorchStoreStrategy,
 )
 from torchstore.controller import Publication
@@ -62,6 +63,7 @@ __all__ = [
     "shutdown",
     "TorchStoreStrategy",
     "LocalRankStrategy",
+    "MultiMeshStrategy",
     "HostStrategy",
     "ControllerStorageVolumes",
     "Publication",
