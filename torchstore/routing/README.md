@@ -29,6 +29,9 @@ other requesters ◀─get───│ volume / RDMA │◀───────
   waits.
 - When the last layout arrives, the barrier completes and every TorchStore client
   has a fixed `local route table`.
+- Each routing client records the wire dtype selected at registration. Publishers
+  cast floating tensors to that dtype, while `preserve_dtype_keys` keeps selected
+  buffers in their registered dtype.
 - For every `put`/`get`, each rank consults that table locally.
 - Some requesters fetch from publishers, then `relay` what they fetched to other
   requesters.
@@ -37,9 +40,17 @@ other requesters ◀─get───│ volume / RDMA │◀───────
 # At startup on application coordinator.
 await ts.initialize(mesh=trainer_mesh, relay_meshes=[gen_mesh], strategy=strategy)
 
-# Once per rank.
-c = await ts.client(role="publisher")            # on publisher
-c = await ts.client(role="requester", group=0)   # on requester
+# Once per publisher rank.
+c = await ts.client(role="publisher")
+await c.register_state_dict(
+    model.state_dict(),
+    "weights",
+    transfer_dtype=torch.bfloat16,
+    preserve_dtype_keys=frozenset(buffer_names),
+)
+
+# Once per requester rank. Its state dict declares the destination dtypes.
+c = await ts.client(role="requester", group=0)
 await c.register_state_dict(model.state_dict(), "weights")
 
 # Every update.

@@ -50,6 +50,8 @@ class RoutingClient(LocalClient):
         self._coordinator = coordinator
         # Object key -> this rank's nested-key mapping
         self._mappings: dict[str, Mapping[str, Any]] = {}
+        # Storage key -> dtype selected during state-dict registration.
+        self._wire_dtypes: dict[str, torch.dtype] = {}
 
     async def register_state_dict(
         self,
@@ -66,13 +68,14 @@ class RoutingClient(LocalClient):
         coordinator. Each namespace has its own barrier, so a rank registers
         the state dicts it routes one at a time.
         """
-        slices, element_sizes, mapping = _state_dict_storage_metadata(
+        slices, element_sizes, dtypes, mapping = _state_dict_storage_metadata(
             state_dict,
             key,
             transfer_dtype=transfer_dtype,
             preserve_dtype_keys=preserve_dtype_keys,
         )
         self._mappings[_state_dict_mapping_key(key)] = mapping
+        self._wire_dtypes.update(dtypes)
         registrations = {
             name: KeyRegistration(tensor_slice, element_sizes[name])
             for name, tensor_slice in slices.items()
@@ -95,13 +98,14 @@ class RoutingClient(LocalClient):
         preserve_dtype_keys: frozenset[str] = frozenset(),
     ) -> None:
         """As :meth:`register_state_dict`, but plan here rather than centrally."""
-        slices, element_sizes, mapping = _state_dict_storage_metadata(
+        slices, element_sizes, dtypes, mapping = _state_dict_storage_metadata(
             state_dict,
             key,
             transfer_dtype=transfer_dtype,
             preserve_dtype_keys=preserve_dtype_keys,
         )
         self._mappings[_state_dict_mapping_key(key)] = mapping
+        self._wire_dtypes.update(dtypes)
         registrations = {
             name: KeyRegistration(tensor_slice, element_sizes[name])
             for name, tensor_slice in slices.items()
@@ -158,8 +162,16 @@ class RoutingClient(LocalClient):
                 f"rank {self._controller.rank!r} does not store {request.key!r}"
             )
         expected = planned.tensor_slice
+        assert request.tensor_val is not None
+        wire_dtype = self._wire_dtypes.get(request.key)
+        if wire_dtype is not None and request.tensor_val.dtype != wire_dtype:
+            if not request.tensor_val.is_floating_point():
+                raise ValueError(
+                    f"published tensor for {request.key!r} has dtype "
+                    f"{request.tensor_val.dtype}, expected {wire_dtype}"
+                )
+            request.tensor_val = request.tensor_val.to(wire_dtype)
         if request.tensor_slice is None:
-            assert request.tensor_val is not None
             if tuple(request.tensor_val.shape) != tuple(expected.local_shape):
                 raise ValueError(
                     f"published tensor for {request.key!r} has shape "
@@ -224,9 +236,15 @@ class RoutingClient(LocalClient):
         )
         for request in requests:
             target = resolved.targets[request.key]
-            if request.tensor_val is not None and tuple(
-                request.tensor_val.shape
-            ) != tuple(target.local_shape):
+            if request.tensor_val is None:
+                continue
+            wire_dtype = self._wire_dtypes.get(request.key)
+            if wire_dtype is not None and request.tensor_val.dtype != wire_dtype:
+                raise ValueError(
+                    f"destination for {request.key!r} has dtype "
+                    f"{request.tensor_val.dtype}, expected {wire_dtype}"
+                )
+            if tuple(request.tensor_val.shape) != tuple(target.local_shape):
                 raise ValueError(
                     f"destination for {request.key!r} has shape "
                     f"{tuple(request.tensor_val.shape)}, expected {target.local_shape}"

@@ -105,7 +105,9 @@ def _coordinator(ranks) -> RoutingCoordinator:
 
 def _registrations(state_dict, key):
     """What one rank reports for a state dict: one registration per key."""
-    slices, element_sizes, _mapping = _state_dict_storage_metadata(state_dict, key)
+    slices, element_sizes, _dtypes, _mapping = _state_dict_storage_metadata(
+        state_dict, key
+    )
     return {
         name: KeyRegistration(tensor_slice, element_sizes[name])
         for name, tensor_slice in slices.items()
@@ -134,7 +136,7 @@ def _register(coordinator, ranks, key=STATE_DICT_KEY):
 
 
 def test_state_dict_metadata_uses_torchstore_keys_and_tensor_dtypes() -> None:
-    slices, element_sizes, _mapping = _state_dict_storage_metadata(
+    slices, element_sizes, dtypes, _mapping = _state_dict_storage_metadata(
         {
             "layer": {"weight": torch.empty(3, 5)},
             "running": torch.empty(2, dtype=torch.float32),
@@ -151,6 +153,8 @@ def test_state_dict_metadata_uses_torchstore_keys_and_tensor_dtypes() -> None:
     assert weight_slice.local_shape == (3, 5)
     assert element_sizes[weight_key] == 2
     assert element_sizes["model_state_dict/running"] == 4
+    assert dtypes[weight_key] == torch.bfloat16
+    assert dtypes["model_state_dict/running"] == torch.float32
 
 
 def test_plan_separates_logical_ranks_and_physical_volumes() -> None:

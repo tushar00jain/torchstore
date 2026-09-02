@@ -481,7 +481,7 @@ def test_real_destination_contents_and_multi_source_assembly() -> None:
 
 def test_state_dict_api_parity_mapping_is_local_and_controller_is_bypassed() -> None:
     source = {"weight": torch.arange(6).view(2, 3), "nested": {"bias": torch.ones(2)}}
-    slices, sizes, _mapping = _state_dict_storage_metadata(source, "model")
+    slices, sizes, _dtypes, _mapping = _state_dict_storage_metadata(source, "model")
     plan = RoutingPlan.build(
         _ranks({"trainer": slices}, sizes),
         _ranks({"generator": slices}, sizes),
@@ -522,6 +522,61 @@ def test_state_dict_api_parity_mapping_is_local_and_controller_is_bypassed() -> 
     ]
 
 
+def test_routing_casts_each_key_to_its_registered_wire_dtype() -> None:
+    source = {
+        "weight": torch.arange(4, dtype=torch.float32),
+        "running": torch.arange(4, dtype=torch.float32),
+    }
+    destination = {
+        "weight": torch.zeros(4, dtype=torch.bfloat16),
+        "running": torch.zeros(4, dtype=torch.float32),
+    }
+    preserved = frozenset({"running"})
+    source_slices, source_sizes, _source_dtypes, _ = _state_dict_storage_metadata(
+        source,
+        "model",
+        transfer_dtype=torch.bfloat16,
+        preserve_dtype_keys=preserved,
+    )
+    dest_slices, dest_sizes, _dest_dtypes, _ = _state_dict_storage_metadata(
+        destination, "model"
+    )
+    plan = RoutingPlan.build(
+        _ranks({"trainer": source_slices}, source_sizes),
+        _ranks({"generator": dest_slices}, dest_sizes),
+    )
+    factory = _TransportFactory()
+    clients = _clients(plan, factory)
+
+    async def register(**_kwargs):
+        return plan, {}
+
+    coordinator = SimpleNamespace(register=_LocalEndpoint(register))
+    clients["trainer"]._coordinator = coordinator
+    clients["generator"]._coordinator = coordinator
+
+    async def run():
+        await clients["trainer"].register_state_dict(
+            source,
+            "model",
+            transfer_dtype=torch.bfloat16,
+            preserve_dtype_keys=preserved,
+        )
+        await clients["generator"].register_state_dict(destination, "model")
+        # The route owns the wire-dtype policy; callers publish their native tensors.
+        await put_state_dict(clients["trainer"], source, "model")
+        return await get_state_dict(clients["generator"], "model", destination)
+
+    result = asyncio.run(run())
+    stored = factory.stores["trainer"]
+    assert stored["model/weight"][1].dtype == torch.bfloat16
+    assert stored["model/running"][1].dtype == torch.float32
+    assert result["weight"] is destination["weight"]
+    assert result["running"] is destination["running"]
+    torch.testing.assert_close(destination["weight"], source["weight"].bfloat16())
+    torch.testing.assert_close(destination["running"], source["running"])
+
+
 def test_fully_local_dtensor_state_dict_uses_local_tensor(tmp_path) -> None:
     if dist.is_initialized():
         pytest.skip("test requires ownership of the default process group")
@@ -539,7 +594,7 @@ def test_fully_local_dtensor_state_dict_uses_local_tensor(tmp_path) -> None:
         destination = DTensor.from_local(
             destination_tensor, mesh, [Replicate()], run_check=False
         )
-        slices, sizes, _mapping = _state_dict_storage_metadata(
+        slices, sizes, _dtypes, _mapping = _state_dict_storage_metadata(
             {"weight": source}, "model"
         )
         plan = RoutingPlan.build(
