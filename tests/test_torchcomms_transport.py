@@ -15,8 +15,10 @@ import torchstore.transport as transport_module
 import torchstore.transport.torchcomms.cache as cache_mod
 from torchstore.transport import TransportType
 from torchstore.transport.buffers import TransportContext
+from torchstore.transport.torchcomms.buffer import TorchCommsRdmaTransportBuffer
 from torchstore.transport.torchcomms.uniflow_buffer import TorchCommsTransportBuffer
-from torchstore.transport.types import Request
+from torchstore.transport.types import Request, TensorSlice
+from torchstore.storage_volume import InMemoryStore
 
 # Unit tests authored by Codex: they cover the main TorchComms workflows and
 # strategy choices: availability gates, handshakes, cache lifecycle, and buffer
@@ -530,8 +532,34 @@ class TestTorchCommsSelection:
             )
 
 
+def test_connection_handshake_ignores_stored_tensor_layout(monkeypatch):
+    store = InMemoryStore()
+    store.kv["weight"] = torch.arange(16).reshape(4, 4)
+    request = Request.from_tensor_slice(
+        "weight",
+        TensorSlice(
+            offsets=(0, 0),
+            coordinates=(0,),
+            global_shape=(4, 4),
+            local_shape=(2, 4),
+            mesh_shape=(2,),
+        ),
+    )
+    buffer = TorchCommsRdmaTransportBuffer(SimpleNamespace())
+
+    async def recv_handshake(_ctx, entries):
+        assert entries == [(request, None)]
+        return []
+
+    monkeypatch.setattr(buffer, "recv_handshake", recv_handshake)
+
+    assert asyncio.run(store.handshake(buffer, [request])) == []
+    assert torch.equal(store._get_data(request), store.kv["weight"][:2])
+
+
 @requires_uniflow
 class TestTorchCommsHandshake:
+
     def test_get_sv_transport_raises_clear_error_for_missing_cached_transport(
         self,
         monkeypatch,
