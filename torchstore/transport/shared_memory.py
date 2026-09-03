@@ -321,6 +321,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
     supports_batch_puts = True
     supports_batch_gets = True
+    handshake_requires_existing_data = True
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         super().__init__(storage_volume_ref)
