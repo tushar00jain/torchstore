@@ -55,6 +55,9 @@ dev = [
     "transformers",
     "ufmt",
 ]
+nixl = [
+    "nixl-cu13==1.4.1 ; sys_platform == 'linux'",
+]
 
 [tool.setuptools.packages.find]
 include = ["torchstore*"]
