@@ -325,6 +325,24 @@ class TestTorchCommsAvailability:
         assert not cache_mod.torchcomms_uniflow_available()
         assert not cache_mod.torchcomms_rdma_available()
 
+    def test_use_torchcomms_uniflow_disables_only_uniflow(self, monkeypatch) -> None:
+        monkeypatch.setenv("USE_TORCHCOMMS", "1")
+        monkeypatch.setenv("USE_TORCHCOMMS_RDMA", "1")
+        monkeypatch.setenv("USE_TORCHCOMMS_UNIFLOW", "0")
+        rdma_transport = type(
+            "FakeRdmaTransport",
+            (),
+            {"supported": staticmethod(lambda: True)},
+        )
+        _set_uniflow_module(monkeypatch, _fake_uniflow_module())
+        _set_torchcomms_transport_module(
+            monkeypatch,
+            SimpleNamespace(RdmaTransport=rdma_transport),
+        )
+
+        assert not cache_mod.torchcomms_uniflow_available()
+        assert cache_mod.torchcomms_rdma_available()
+
     @requires_uniflow
     def test_uniflow_cache_reuses_registration(self, monkeypatch) -> None:
         _set_uniflow_module(
