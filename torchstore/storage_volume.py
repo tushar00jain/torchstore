@@ -155,7 +155,15 @@ class InMemoryStore(StorageImpl):
         transport_buffer: TransportBuffer,
         requests: list[Request],
     ) -> list[Any]:
-        pairs = [(request, self._extract_existing(request)) for request in requests]
+        pairs = [
+            (
+                request,
+                self._extract_existing(request)
+                if transport_buffer.handshake_requires_existing_data
+                else None,
+            )
+            for request in requests
+        ]
         return await transport_buffer.recv_handshake(self.transport_context, pairs)
 
     def _extract_existing(self, request: "Request") -> torch.Tensor | None:

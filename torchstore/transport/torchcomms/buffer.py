@@ -153,6 +153,23 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             device_index=RdmaTransportCache.device_to_index(tensor.device),
         )
 
+    def _allocate_request_ctx(
+        self, request: Request, tensor: torch.Tensor, operation: str
+    ) -> RdmaContext:
+        try:
+            return self._allocate_ctx(tensor)
+        except Exception as error:
+            storage = tensor.untyped_storage()
+            raise RuntimeError(
+                "TorchComms RDMA registration failed for "
+                f"{operation} key={request.key!r}: shape={tuple(tensor.shape)}, "
+                f"stride={tuple(tensor.stride())}, storage_offset={tensor.storage_offset()}, "
+                f"nbytes={tensor.nbytes}, storage_nbytes={storage.nbytes()}, "
+                f"dtype={tensor.dtype}, device={tensor.device}, "
+                f"contiguous={tensor.is_contiguous()}, is_view={tensor._base is not None}, "
+                f"tensor_slice={request.tensor_slice}"
+            ) from error
+
     async def _pre_put_hook(self, requests: list[Request]) -> None:
         """Allocate RDMA memory for put (transport already set up)."""
         self._contexts = []
@@ -170,7 +187,9 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
                     )
                     # stage contiguous copy on CPU to avoid GPU OOM
                     tensor = tensor.cpu().contiguous()
-                self._contexts.append(self._allocate_ctx(tensor))
+                self._contexts.append(
+                    self._allocate_request_ctx(request, tensor, operation="PUT")
+                )
 
     async def _pre_get_hook(self, requests: list[Request]) -> None:
         """Fetch metadata if needed and allocate RDMA buffers."""
@@ -200,7 +219,9 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
                     meta[0], dtype=meta[1], device=torch.device("cpu")
                 )
 
-            self._contexts.append(self._allocate_ctx(tensor_ref))
+            self._contexts.append(
+                self._allocate_request_ctx(request, tensor_ref, operation="GET")
+            )
 
     async def handle_put_request(
         self,
