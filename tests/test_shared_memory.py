@@ -460,6 +460,7 @@ class TestSharedMemoryTransportBufferPUT:
         buffer = SharedMemoryTransportBuffer(ref)
         requests = [Request(key="key1", tensor_val=torch.randn(5, 5))]
 
+        assert buffer.handshake_requires_existing_data is True
         assert buffer.requires_handshake(requests) is False
         buffer._needs_handshake = True
         assert buffer.requires_handshake(requests) is True
