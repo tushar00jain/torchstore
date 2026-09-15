@@ -290,10 +290,15 @@ configuration is needed — the selection happens at runtime:
 | Priority | Transport | When used |
 |----------|-----------|-----------|
 | 1 | **POSIX Shared Memory** | Client and storage volume are on the same host |
-| 2 | **Monarch RDMA** | Cross-host, `monarch.rdma` available |
-| 3 | **TorchComms RDMA** | Cross-host, `torchcomms` installed |
+| 2 | **TorchComms** | Cross-host, a supported TorchComms implementation is available |
+| 3 | **Monarch RDMA** | Cross-host, `monarch.rdma` available |
 | 4 | **Gloo** | Cross-host fallback via collective transport |
 | 5 | **Monarch RPC** | Universal fallback, always available |
+
+TorchComms prefers Uniflow and falls back to its legacy CTran-backed RDMA
+implementation. Set `USE_TORCHCOMMS_UNIFLOW=0` to skip Uniflow and use that
+fallback. Both `USE_TORCHCOMMS=1` and the backward-compatible
+`USE_TORCHCOMMS_RDMA=1` gate must also be enabled.
 
 To force a specific transport, pass `default_transport_type` when constructing a
 strategy:
