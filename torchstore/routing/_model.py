@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Dict, Tuple
 
 from torchstore.transport.types import TensorSlice
 
@@ -56,10 +58,21 @@ class Transfer:
 
 @dataclass(frozen=True)
 class DestinationRoute:
-    """Reads that fill one local requester slice."""
+    """Reads and relay coordination for one local requester slice."""
 
     destination_slice: TensorSlice
     transfers: tuple[Transfer, ...]
+    # Relay IDs carry their storage key, so plans built for different
+    # state-dict namespaces cannot signal each other through a shared service.
+    wait_for_relay_id: str | None = None
+    notify_relay_id: str | None = None
+    notify_peers: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.wait_for_relay_id is not None and self.notify_relay_id is not None:
+            raise ValueError("a pull route cannot wait and notify")
+        if bool(self.notify_peers) != (self.notify_relay_id is not None):
+            raise ValueError("relay notification requires an ID and peers")
 
 
 RouteEntry = tuple[DestinationRoute, ...]
