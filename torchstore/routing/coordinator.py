@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Collection, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from monarch.actor import (  # type: ignore[import-untyped]
@@ -20,6 +20,8 @@ from monarch.actor import (  # type: ignore[import-untyped]
 
 from torchstore.strategy import TorchStoreStrategy
 from ._model import KeyRegistration, RankRole, Registrations
+from .plan import RoutingPlan
+from .service import RoutingService, RoutingServiceGroup
 
 __all__ = ["RoutingCoordinator"]
 
@@ -28,10 +30,13 @@ _LAYOUT_REGISTRATION_TIMEOUT_S = 5 * 60
 
 @dataclass
 class _Layouts:
-    """Stored registrations for one state-dict namespace."""
+    """Stored registrations and derived plan for one state-dict namespace."""
 
     publishers: Registrations = field(default_factory=dict)
     requesters: Registrations = field(default_factory=dict)
+    # Built once, by whichever rank asks first, then shared
+    plan: RoutingPlan | None = None
+    error: Exception | None = None
     # Coordinate idempotent layout registration:
     # - The first call from a rank stores its layout.
     # - Later calls from that rank leave the stored layout unchanged.
@@ -45,24 +50,24 @@ class _Layouts:
 
 
 class RoutingCoordinator(Actor):
-    """Exchanges per-rank layouts, one state-dict namespace at a time.
+    """Turns per-rank layouts into per-rank route tables, one namespace at a time.
 
     Every namespace stores its own layouts, so a rank registers each state dict
     it routes when ready and receives the complete set once all ranks arrive.
     """
 
     def __init__(self) -> None:
-        self._ranks: frozenset[str] | None = None
+        self._services: RoutingServiceGroup | None = None
         self._strategy: TorchStoreStrategy | None = None
         self._layouts: dict[str, _Layouts] = {}
 
     @endpoint
     async def init(
         self,
-        ranks: Collection[str],
+        services: RoutingServiceGroup,
         strategy: TorchStoreStrategy,
     ) -> None:
-        self._ranks = frozenset(ranks)
+        self._services = services
         self._strategy = strategy
         self._layouts = {}
 
@@ -81,9 +86,9 @@ class RoutingCoordinator(Actor):
         registrations: Mapping[str, KeyRegistration],
     ) -> _Layouts:
         """Record one rank's layout for ``key`` and wait for every other rank."""
-        if self._ranks is None:
+        if self._services is None:
             raise RuntimeError("RoutingCoordinator.init has not run")
-        if rank not in self._ranks:
+        if rank not in self._services.ranks:
             raise KeyError(f"{rank!r} is not a routing participant")
         layouts = self._layouts.setdefault(key, _Layouts())
         by_role = (
@@ -92,15 +97,17 @@ class RoutingCoordinator(Actor):
         async with layouts.condition:
             if rank not in layouts.ranks:
                 by_role[rank] = dict(registrations)
-                if layouts.ranks == self._ranks:
+                if layouts.ranks == self._services.ranks:
                     layouts.condition.notify_all()
             try:
                 await asyncio.wait_for(
-                    layouts.condition.wait_for(lambda: layouts.ranks == self._ranks),
+                    layouts.condition.wait_for(
+                        lambda: layouts.ranks == self._services.ranks
+                    ),
                     timeout=_LAYOUT_REGISTRATION_TIMEOUT_S,
                 )
             except asyncio.TimeoutError as error:
-                missing = self._ranks - layouts.ranks
+                missing = self._services.ranks - layouts.ranks
                 raise TimeoutError(
                     f"timed out after {_LAYOUT_REGISTRATION_TIMEOUT_S} seconds "
                     f"waiting for layouts for {key!r}; "
@@ -109,13 +116,54 @@ class RoutingCoordinator(Actor):
         return layouts
 
     @concurrent_endpoint
+    async def register(
+        self,
+        rank: str,
+        role: RankRole,
+        key: str,
+        registrations: Mapping[str, KeyRegistration],
+    ) -> tuple[RoutingPlan, dict[str, RoutingService]]:
+        """Report one rank's layout for ``key`` and get its plan back built here."""
+        layouts = await self._gathered(rank, role, key, registrations)
+        async with layouts.condition:
+            if layouts.plan is None and layouts.error is None:
+                # Remembered, or the ranks behind this one each rebuild a plan
+                # that is never going to succeed.
+                try:
+                    layouts.plan = RoutingPlan.build(
+                        layouts.publishers, layouts.requesters
+                    )
+                except Exception as error:  # noqa: BLE001 - re-raised below
+                    layouts.error = error
+        if layouts.error is not None:
+            raise layouts.error
+        assert layouts.plan is not None
+        assert self._services is not None  # _gathered raises when it is not
+
+        peers = {
+            peer
+            for entry in layouts.plan._local(rank).keys.values()
+            for route in entry.routes
+            for peer in route.notify_peers
+        }
+        return (
+            layouts.plan.for_rank(rank),
+            {peer: self._services.get_service(peer) for peer in peers | {rank}},
+        )
+
+    @concurrent_endpoint
     async def register_layouts(
         self,
         rank: str,
         role: RankRole,
         key: str,
         registrations: Mapping[str, KeyRegistration],
-    ) -> tuple[Registrations, Registrations]:
+    ) -> tuple[Registrations, Registrations, dict[str, RoutingService]]:
         """Report one rank's layout for ``key`` and get every rank's back."""
         layouts = await self._gathered(rank, role, key, registrations)
-        return layouts.publishers, layouts.requesters
+        assert self._services is not None  # _gathered raises when it is not
+        return (
+            layouts.publishers,
+            layouts.requesters,
+            {peer: self._services.get_service(peer) for peer in self._services.ranks},
+        )
