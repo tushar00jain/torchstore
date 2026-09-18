@@ -8,7 +8,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import asyncio
+from collections import defaultdict
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -24,6 +26,7 @@ from ._model import (
 
 if TYPE_CHECKING:
     from .plan import RoutingPlan
+    from .service import RoutingService
 
 
 @dataclass(frozen=True)
@@ -33,12 +36,40 @@ class _ResolvedRead:
     targets: Mapping[str, TensorSlice]
     routes: Mapping[str, DestinationRoute]
 
+    def keys_for(self, *, relay: bool) -> tuple[str, ...]:
+        return tuple(
+            key
+            for key, route in self.routes.items()
+            if (route.wait_for_relay_id is not None) == relay
+        )
+
+    @property
+    def notifications(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        return tuple(
+            (route.notify_relay_id, route.notify_peers)
+            for route in self.routes.values()
+            if route.notify_relay_id is not None
+        )
+
+    @property
+    def relay_ids(self) -> tuple[str, ...]:
+        return tuple(
+            route.wait_for_relay_id
+            for route in self.routes.values()
+            if route.wait_for_relay_id is not None
+        )
+
+
 class RoutingDirectory:
-    """Rank-local route metadata."""
+    """Rank-local route metadata and transport-neutral coordination."""
 
     def __init__(self, rank: str) -> None:
         self.rank = rank
         self._routes: LocalRouteTable | None = None
+        # This rank's own service plus every peer it relays with.
+        self._services: dict[str, RoutingService] = {}
+        self._consumed_generations: dict[str, int] = defaultdict(int)
+        self._signaled_generations: dict[str, int] = defaultdict(int)
 
     @property
     def routes(self) -> LocalRouteTable:
@@ -48,13 +79,16 @@ class RoutingDirectory:
             )
         return self._routes
 
-    def install(self, plan: RoutingPlan) -> None:
+    def install(
+        self, plan: RoutingPlan, services: Mapping[str, RoutingService]
+    ) -> None:
         """Add one namespace's routes to this rank's table.
 
         Storage keys carry their namespace, so tables for different state dicts
         merge without collision.
         """
         table = plan._local(self.rank)
+        self._services.update(services)
         if self._routes is None:
             self._routes = table
             return
@@ -127,3 +161,30 @@ class RoutingDirectory:
             for route in entry.routes
             for transfer in route.transfers
         } or {self.routes.volume_id}
+
+    async def notify_ready(
+        self, notifications: Iterable[tuple[str, tuple[str, ...]]]
+    ) -> None:
+        for relay_id, peers in notifications:
+            generation = self._signaled_generations[relay_id] + 1
+            await asyncio.gather(
+                *(
+                    self._services[peer].notify_ready.call_one(generation, relay_id)
+                    for peer in peers
+                )
+            )
+            self._signaled_generations[relay_id] = generation
+
+    async def wait_ready(self, relay_ids: Iterable[str]) -> None:
+        waits = []
+        generations = []
+        service = self._services.get(self.rank)
+        for relay_id in relay_ids:
+            if service is None:
+                raise RuntimeError("relay routes require a rank-local RoutingService")
+            generation = self._consumed_generations[relay_id] + 1
+            waits.append(service.wait_ready.call_one(generation, relay_id))
+            generations.append((relay_id, generation))
+        await asyncio.gather(*waits)
+        for relay_id, generation in generations:
+            self._consumed_generations[relay_id] = generation
