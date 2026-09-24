@@ -12,7 +12,7 @@ import zlib
 from collections import defaultdict
 from collections.abc import Callable, Collection, Mapping, Sequence
 from enum import Enum
-from typing import DefaultDict, TypeVar
+from typing import DefaultDict, Dict, List, Tuple, TypeVar
 
 from torchstore.transport.types import TensorSlice
 from torchstore.utils import get_slice_intersection, get_slice_numel
@@ -45,15 +45,44 @@ def _geometry_key(tensor_slice: TensorSlice) -> _GeometryKey:
 
 
 class Balance(str, Enum):
-    """How to choose between ranks holding byte-identical data."""
+    """How to choose between ranks holding or wanting byte-identical data."""
 
-    # A pure function of the key, so every local planner makes the same choice.
+    # Based on knowledge of global load
+    LEAST_LOADED = "least_loaded"
+    # Pure function of the key
     ROTATE = "rotate"
+
+    @property
+    def sequential(self) -> bool:
+        """Whether a choice depends on the choices made before it."""
+        return self is Balance.LEAST_LOADED
 
 
 def _itself(candidate: str) -> str:
     """Name of a candidate that is already just a rank."""
     return candidate
+
+
+class _LeastLoaded:
+    """Hands each choice to whichever candidate has been given the fewest bytes."""
+
+    def __init__(self) -> None:
+        self._assigned: DefaultDict[str, int] = defaultdict(int)
+
+    def choose(
+        self,
+        key: str,
+        index: int,
+        candidates: Sequence[_Candidate],
+        nbytes: int,
+        name: Callable[[_Candidate], str] = _itself,
+    ) -> _Candidate:
+        chosen = min(
+            candidates,
+            key=lambda candidate: (self._assigned[name(candidate)], name(candidate)),
+        )
+        self._assigned[name(chosen)] += nbytes
+        return chosen
 
 
 class _Rotate:
@@ -70,7 +99,7 @@ class _Rotate:
         return candidates[(zlib.crc32(key.encode()) + index) % len(candidates)]
 
 
-_BALANCERS = {Balance.ROTATE: _Rotate}
+_BALANCERS = {Balance.LEAST_LOADED: _LeastLoaded, Balance.ROTATE: _Rotate}
 
 
 def _geometry_slice(geometry: _GeometryKey) -> TensorSlice:
@@ -249,26 +278,67 @@ class _Builder:
         #   publishers                 requesters
         #   P0 [rows 0-3] --+
         #                   +--pull--> R0
-        #   P1 [rows 4-7] --+
+        #   P1 [rows 4-7] --+           |
+        #                               +--relay--> R1 (waits, then pulls)
         #
         #   R0: DestinationRoute(dest=rows0-7,
-        #                        transfers=[P0->rows0-3, P1->rows4-7])
+        #                        transfers=[P0->rows0-3, P1->rows4-7],
+        #                        notify_relay_id="weights#0", notify_peers=("R1",))
+        #   R1: DestinationRoute(dest=rows0-7, transfers=[R0->rows0-7],
+        #                        wait_for_relay_id="weights#0")
         routes: DefaultDict[
             str, DefaultDict[str, list[DestinationRoute]]
         ] = defaultdict(lambda: defaultdict(list))
 
         wanted = set(targets)
-        for rank, registrations in sorted(self.requesters.items()):
-            if rank not in wanted:
-                continue
-            for storage_key, registration in sorted(registrations.items()):
-                target = self._slice(_geometry_key(registration.tensor_slice))
-                routes[rank][storage_key].append(
-                    DestinationRoute(
-                        destination_slice=registration.tensor_slice,
-                        transfers=self._publisher_transfers(storage_key, target),
-                    )
+        for storage_key, groups in _group_by_geometry(self.requesters).items():
+            for relay_index, (geometry, members) in enumerate(groups):
+                if len(wanted) < len(self.by_rank) and wanted.isdisjoint(
+                    member for member, _slice in members
+                ):
+                    continue  # no target wants this geometry
+
+                target = self._slice(geometry)
+                target_bytes = get_slice_numel(target) * self.element_sizes[storage_key]
+                # The ingress rank serves every peer, and how many peers there
+                # are does not depend on which member is chosen.
+                ingress_rank, ingress_slice = self.balance.choose(
+                    storage_key,
+                    relay_index,
+                    members,
+                    target_bytes * (len(members) - 1),
+                    name=lambda member: member[0],
                 )
+                peers = tuple(member for member in members if member[0] != ingress_rank)
+
+                relay_id = f"{storage_key}#{relay_index}" if peers else None
+
+                if ingress_rank in wanted:
+                    routes[ingress_rank][storage_key].append(
+                        DestinationRoute(
+                            destination_slice=ingress_slice,
+                            transfers=self._publisher_transfers(storage_key, target),
+                            notify_relay_id=relay_id,
+                            notify_peers=tuple(peer for peer, _slice in peers),
+                        )
+                    )
+                for peer, peer_slice in peers:
+                    if peer not in wanted:
+                        continue
+                    routes[peer][storage_key].append(
+                        DestinationRoute(
+                            destination_slice=peer_slice,
+                            transfers=(
+                                Transfer(
+                                    source=ingress_rank,
+                                    source_volume_id=ingress_rank,
+                                    segment=target,
+                                    nbytes=target_bytes,
+                                ),
+                            ),
+                            wait_for_relay_id=relay_id,
+                        )
+                    )
 
         tables: dict[str, LocalRouteTable] = {}
         for rank in sorted(wanted):
@@ -297,6 +367,17 @@ class RoutingPlan:
         self._routes = dict(routes)
 
     @classmethod
+    def build(
+        cls,
+        publishers: Registrations,
+        requesters: Registrations,
+        balance: Balance = Balance.LEAST_LOADED,
+    ) -> RoutingPlan:
+        """Reconcile every rank's reported layout into every rank's plan."""
+        by_rank = {**publishers, **requesters}
+        return cls(_Builder(publishers, requesters, balance).build(by_rank))
+
+    @classmethod
     def build_for(
         cls,
         rank: str,
@@ -304,13 +385,26 @@ class RoutingPlan:
         requesters: Registrations,
         balance: Balance = Balance.ROTATE,
     ) -> RoutingPlan:
-        """Reconcile every rank's reported layout into ``rank``'s own plan."""
+        """Reconcile every rank's reported layout into ``rank``'s own plan.
+
+        Raises:
+            ValueError: for a balance that has to see every rank to be correct.
+        """
+        if balance.sequential:
+            raise ValueError(
+                f"{balance.value!r} balances against a running total, so ranks "
+                "only agree when one planner builds them all"
+            )
         return cls(_Builder(publishers, requesters, balance).build({rank}))
 
     @property
     def ranks(self) -> tuple[str, ...]:
         """Ranks with a local table in this plan."""
         return tuple(sorted(self._routes))
+
+    def for_rank(self, rank: str) -> RoutingPlan:
+        """Return a distributable plan containing only ``rank``'s local table."""
+        return RoutingPlan({rank: self._routes[rank]})
 
     def lookup(self, rank: str, key: str) -> RouteEntry:
         """Return the immutable local actions for ``rank`` and ``key``."""
