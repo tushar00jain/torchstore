@@ -46,7 +46,11 @@ def torchcomms_enabled() -> bool:
 
 @cache
 def torchcomms_uniflow_available() -> bool:
-    if not torchcomms_enabled() or _uniflow_transport is None:
+    if (
+        not torchcomms_enabled()
+        or os.environ.get("USE_TORCHCOMMS_UNIFLOW", "1") != "1"
+        or _uniflow_transport is None
+    ):
         return False
 
     try:
