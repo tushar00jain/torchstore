@@ -168,6 +168,7 @@ docs/src
 *.torchxconfig
 
 # Unit test / coverage reports
+/test-output/
 htmlcov/
 .tox/
 .nox/
