@@ -17,6 +17,7 @@ from torchstore.controller import Controller, ControllerDirectory
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.coordinator import RoutingCoordinator
+from torchstore.routing.storage_volume import RoutingStorageVolume
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
 from torchstore.transport.types import TensorSlice
@@ -122,7 +123,7 @@ async def _initialize_routing(
 ) -> None:
     """Spawn trainer volumes and the coordinator that routing mode needs."""
     namespace = _routing_namespace(RankRole.PUBLISHER, None)
-    volumes = await StorageVolume.spawn(
+    volumes = await RoutingStorageVolume.spawn(
         1,
         mesh,
         id_func=partial(_routing_volume_id, namespace),
@@ -319,16 +320,14 @@ async def get(
 async def get_batch(
     keys: list[str],
     store_name: str = DEFAULT_TORCHSTORE_NAME,
-) -> dict[str, Any]:
-    ...
+) -> dict[str, Any]: ...
 
 
 @overload
 async def get_batch(
     keys: dict[str, torch.Tensor | DTensor | None],
     store_name: str = DEFAULT_TORCHSTORE_NAME,
-) -> dict[str, Any]:
-    ...
+) -> dict[str, Any]: ...
 
 
 async def get_batch(
@@ -449,6 +448,7 @@ async def put_state_dict(
     store_name: str = DEFAULT_TORCHSTORE_NAME,
     direct_rdma: bool = False,
     transfer_dtype: "torch.dtype | None" = None,
+    preserve_dtype_keys: frozenset[str] = frozenset(),
 ) -> None:
     """Store a PyTorch model state_dict in the distributed store.
 
@@ -468,6 +468,8 @@ async def put_state_dict(
             weights to this dtype for transfer. Allows the source to keep
             higher-precision master weights (e.g. float32) while transferring
             in a lower precision (e.g. bfloat16).
+        preserve_dtype_keys: Flattened state-dict keys that retain their source
+            dtype when ``transfer_dtype`` is set.
 
     Example:
         >>> model = torch.nn.Linear(10, 5)
@@ -480,7 +482,24 @@ async def put_state_dict(
         key=key,
         direct_rdma=direct_rdma,
         transfer_dtype=transfer_dtype,
+        preserve_dtype_keys=preserve_dtype_keys,
     )
+
+
+async def prepare_state_dict(
+    key: str,
+    user_state_dict: dict[str, Any],
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> None:
+    """Register a requester's state-dict layout without fetching data.
+
+    Args:
+        key: Unique identifier for the state dict.
+        user_state_dict: Destination state dict that describes the requester layout.
+        store_name: Name of the store to use.
+    """
+    cl = await client(store_name)
+    await cl.register_requester_layout(user_state_dict, key)
 
 
 async def get_state_dict(

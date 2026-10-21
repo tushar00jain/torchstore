@@ -68,6 +68,8 @@ async def registered_clients(
     publishers: Mapping[str, Mapping[str, Any]],
     requesters: Mapping[str, Mapping[str, Any]],
     namespace: str = "model",
+    *,
+    strict: bool = True,
 ) -> dict[str, RoutingClient]:
     """Spawn clients and explicitly register layouts for low-level API tests."""
     clients = await routing_clients(publishers, requesters)
@@ -77,8 +79,17 @@ async def registered_clients(
             for rank, state_dict in publishers.items()
         ),
         *(
-            clients[rank].get_layouts(state_dict, namespace)
+            clients[rank].register_requester_layout(state_dict, namespace)
             for rank, state_dict in requesters.items()
         ),
+    )
+    await asyncio.gather(
+        *(clients[rank].get_requester_layouts(namespace) for rank in publishers)
+    )
+    await asyncio.gather(
+        *(
+            clients[rank].get_layouts(state_dict, namespace, strict=strict)
+            for rank, state_dict in requesters.items()
+        )
     )
     return clients
