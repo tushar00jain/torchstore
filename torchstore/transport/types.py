@@ -104,6 +104,9 @@ class Request:
     tensor_slice: TensorSlice | None = None
     objects: Any | None = None
     is_object: bool = False
+    requester_id: str | None = None
+    storage_layouts: dict[str, tuple[TensorSlice, torch.dtype]] | None = None
+    stable_storage: bool = False
 
     @classmethod
     def from_any(
@@ -215,4 +218,7 @@ class Request:
             tensor_slice=self.tensor_slice,
             objects=self.objects,
             is_object=self.is_object,
+            requester_id=self.requester_id,
+            storage_layouts=self.storage_layouts,
+            stable_storage=self.stable_storage,
         )

@@ -21,7 +21,7 @@ from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer
 from torchstore.transport.types import Request
 from torchstore.utils import same_slice_geometry
-from ._model import KeyRegistration, RankRole
+from ._model import KeyRegistration, RankRole, Registrations
 from .coordinator import RoutingCoordinator
 from .directory import RoutingDirectory
 from .plan import RoutingPlan
@@ -45,6 +45,8 @@ class RoutingClient(LocalClient):
         self._role = role
         self._coordinator = coordinator
         self._registered_layouts: set[str] = set()
+        self._requester_layouts: dict[str, dict[str, KeyRegistration]] = {}
+        self._requester_layouts_pending = False
 
     @torch.no_grad()
     async def register_layout(
@@ -97,7 +99,10 @@ class RoutingClient(LocalClient):
                 "user_state_dict is required for the first routed get_state_dict"
             )
 
-        publishers = await self._coordinator.get_layouts.call_one(key=key)
+        publishers = await self._coordinator.get_layouts.call_one(
+            rank=self._routing_directory.rank,
+            key=key,
+        )
         slices, dtypes, _mapping = _state_dict_storage_metadata(state_dict, key)
         if not strict:
             published_keys = {
@@ -115,11 +120,31 @@ class RoutingClient(LocalClient):
             name: KeyRegistration(tensor_slice, dtype=dtypes[name])
             for name, tensor_slice in slices.items()
         }
+        await self._coordinator.register_requester_layout.call_one(
+            rank=self._routing_directory.rank,
+            key=key,
+            registrations=registrations,
+        )
         rank = self._routing_directory.rank
         self._routing_directory.install(
             RoutingPlan.for_requester(rank, registrations, publishers)
         )
         self._registered_layouts.add(key)
+
+    @torch.no_grad()
+    async def get_requester_layouts(self, key: str) -> Registrations:
+        """Wait for this publisher's requester layouts."""
+        if self._role != RankRole.PUBLISHER:
+            raise RuntimeError("only publisher clients get requester layouts")
+        rank = self._routing_directory.rank
+        layouts = await self._coordinator.get_requester_layouts.call_one(
+            rank=rank,
+            key=key,
+        )
+        for requester, registrations in layouts.items():
+            self._requester_layouts.setdefault(requester, {}).update(registrations)
+        self._requester_layouts_pending = True
+        return layouts
 
     @torch.no_grad()
     async def put_batch(self, entries: dict[str, torch.Tensor | Any]) -> None:
@@ -143,9 +168,17 @@ class RoutingClient(LocalClient):
             self._routing_directory.routes.volume_id
         )
         transport_buffer = create_transport_buffer(storage_volume_ref)
+        if self._requester_layouts_pending:
+            for request in requests:
+                request.storage_layouts = {
+                    requester: (registration.tensor_slice, registration.dtype)
+                    for requester, registrations in self._requester_layouts.items()
+                    if (registration := registrations.get(request.key)) is not None
+                }
         latency_tracker.track_step("create transport buffer")
 
         await transport_buffer.put_to_storage_volume(requests)
+        self._requester_layouts_pending = False
         latency_tracker.track_step("put_to_storage_volume")
         latency_tracker.track_e2e()
 
@@ -207,6 +240,16 @@ class RoutingClient(LocalClient):
 
         tracker.track_e2e()
         return published
+
+    async def _fetch_results(
+        self,
+        volume_requests: dict[str, list[Request]],
+        transport_buffer_map: dict,
+    ) -> list[tuple[Request, Any]]:
+        for requests in volume_requests.values():
+            for request in requests:
+                request.requester_id = self._routing_directory.rank
+        return await super()._fetch_results(volume_requests, transport_buffer_map)
 
     def _resolve_destinations(self, requests: list[Request]) -> None:
         """Look up each request's planned route, checking the caller's buffer."""

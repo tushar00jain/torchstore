@@ -17,6 +17,7 @@ from torchstore.controller import Controller, ControllerDirectory
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.coordinator import RoutingCoordinator
+from torchstore.routing.storage_volume import RoutingStorageVolume
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
 from torchstore.transport.types import TensorSlice
@@ -122,7 +123,7 @@ async def _initialize_routing(
 ) -> None:
     """Spawn trainer volumes and the coordinator that routing mode needs."""
     namespace = _routing_namespace(RankRole.PUBLISHER, None)
-    volumes = await StorageVolume.spawn(
+    volumes = await RoutingStorageVolume.spawn(
         1,
         mesh,
         id_func=partial(_routing_volume_id, namespace),
