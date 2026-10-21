@@ -101,7 +101,12 @@ def _get_rdma_cache(store) -> _DirectRDMACache:
 
 
 async def put_state_dict(
-    store, state_dict, key, direct_rdma=False, transfer_dtype=None
+    store,
+    state_dict,
+    key,
+    direct_rdma=False,
+    transfer_dtype=None,
+    preserve_dtype_keys=frozenset(),
 ):
     """Store a state dict in TorchStore.
 
@@ -120,7 +125,11 @@ async def put_state_dict(
     Args:
         transfer_dtype: If set, cast floating-point weights to this dtype for
             transfer. Allows the source to keep higher-precision master weights
-            while transferring in a lower precision (e.g. bfloat16).
+            while transferring in a lower precision (e.g. bfloat16). Routing
+            stores instead use each requester's registered dtype and perform the
+            conversion in the storage volume.
+        preserve_dtype_keys: Flattened state-dict keys that retain their source
+            dtype when ``transfer_dtype`` is set.
     """
     # Coarse weight-sync phase timing, logged at INFO (no TORCHSTORE_LOG_LEVEL
     # =DEBUG / init_logging() needed) so callers can attribute latency to the
@@ -131,7 +140,13 @@ async def put_state_dict(
     )
 
     if direct_rdma:
-        await _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype)
+        await _put_state_dict_direct_rdma(
+            store,
+            state_dict,
+            key,
+            transfer_dtype,
+            preserve_dtype_keys,
+        )
         # No throughput here: the direct-RDMA put only registers handles (and on
         # repeat calls refreshes staging buffers). The bytes move on the
         # generator's get via one-sided RDMA read, so there is no bulk transfer
@@ -139,20 +154,23 @@ async def put_state_dict(
         tracker.track_e2e()
         return
 
+    stages_state_dict_dtypes = getattr(store, "stages_state_dict_dtypes", False)
     await store.register_layout(
         state_dict,
         key,
-        transfer_dtype=transfer_dtype,
+        transfer_dtype=None if stages_state_dict_dtypes else transfer_dtype,
+        preserve_dtype_keys=preserve_dtype_keys,
     )
+    await store.get_requester_layouts(key)
 
     flattened_state_dict, mapping = flatten_state_dict(state_dict)
     tracker.track_step("flatten")
-    # TODO: when transfer_dtype actually casts (source dtype != transfer_dtype),
-    # this allocates a full auxiliary copy of the floating weights. Fold the cast
-    # into the per-tensor staging copy (allocate the staging buffer at
-    # transfer_dtype and copy_ into it) so peak extra memory is one tensor, not
-    # the whole state dict.
-    flattened_state_dict = _cast_floating_tensors(flattened_state_dict, transfer_dtype)
+    if not stages_state_dict_dtypes:
+        flattened_state_dict = _cast_floating_tensors(
+            flattened_state_dict,
+            transfer_dtype,
+            preserve_dtype_keys,
+        )
     tracker.track_step("cast")
     nbytes = _flattened_nbytes(flattened_state_dict)
 
@@ -244,7 +262,7 @@ async def get_state_dict(
     return out
 
 
-def _cast_floating_tensors(flattened_state_dict, dtype):
+def _cast_floating_tensors(flattened_state_dict, dtype, preserve_dtype_keys):
     if dtype is None:
         return flattened_state_dict
     return {
@@ -254,6 +272,7 @@ def _cast_floating_tensors(flattened_state_dict, dtype):
                 isinstance(value, torch.Tensor)
                 and value.is_floating_point()
                 and value.dtype != dtype
+                and key not in preserve_dtype_keys
             )
             else value
         )
@@ -286,7 +305,13 @@ def _state_dict_size(state_dict):
 # ---------------------------------------------------------------------------
 
 
-async def _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype=None):
+async def _put_state_dict_direct_rdma(
+    store,
+    state_dict,
+    key,
+    transfer_dtype=None,
+    preserve_dtype_keys=frozenset(),
+):
     """Register or refresh RDMA handles and publish via TorchStore.
 
     First call for a given key: registers RDMA handles for each param,
@@ -311,7 +336,10 @@ async def _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype=Non
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         handles = cache.source.register(
-            state_dict, rank=rank, transfer_dtype=transfer_dtype
+            state_dict,
+            rank=rank,
+            transfer_dtype=transfer_dtype,
+            preserve_dtype_keys=preserve_dtype_keys,
         )
         await store.put(f"{key}/rank_{rank}", handles)
         if rank == 0:

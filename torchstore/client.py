@@ -44,6 +44,8 @@ class LocalClient:
     volumes through the configured strategy and managing data transport.
     """
 
+    stages_state_dict_dtypes = False
+
     def __init__(
         self,
         directory: VolumeDirectory,
@@ -65,6 +67,13 @@ class LocalClient:
     ) -> None:
         """Hook for clients that require state-dict publisher registration."""
 
+    async def register_requester_layout(
+        self,
+        state_dict: Mapping[str, Any] | None,
+        key: str,
+    ) -> None:
+        """Hook for clients that register state-dict requester layouts."""
+
     async def get_layouts(
         self,
         state_dict: Mapping[str, Any] | None,
@@ -73,6 +82,9 @@ class LocalClient:
         strict: bool = True,
     ) -> None:
         """Hook for clients that require state-dict requester registration."""
+
+    async def get_requester_layouts(self, key: str) -> Any:
+        """Hook for clients that prepare publisher data for requester layouts."""
 
     @torch.no_grad
     async def put(self, key: str, value: torch.Tensor | Any):

@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import hashlib
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import Any, TYPE_CHECKING, TypeVar
@@ -31,6 +32,18 @@ class TransportCache(ABC):
     @abstractmethod
     def clear(self) -> None:
         ...
+
+
+class RequestMetadataCache(TransportCache):
+    """Caches routing request metadata on both sides of a transport RPC."""
+
+    def __init__(self) -> None:
+        self.published: set[tuple[str, str, str]] = set()
+        self.layouts: dict[tuple[str, str], list[Request]] = {}
+
+    def clear(self) -> None:
+        self.published.clear()
+        self.layouts.clear()
 
 
 T = TypeVar("T", bound=TransportCache)
@@ -180,6 +193,117 @@ class TransportBuffer:
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         self.storage_volume_ref = storage_volume_ref
+        self._request_cache_namespace: str | None = None
+        self._request_layout_id: str | None = None
+        self._request_operation: str | None = None
+        self._request_metadata_compact = False
+        self._server_request_received = False
+
+    def enable_request_metadata_cache(self, namespace: str) -> None:
+        """Enable compact requests for a caller with immutable routing layouts."""
+        self._request_cache_namespace = namespace
+
+    @staticmethod
+    def _slice_signature(tensor_slice: Any) -> Any:
+        if tensor_slice is None:
+            return None
+        return (
+            tensor_slice.offsets,
+            tensor_slice.global_shape,
+            tensor_slice.local_shape,
+        )
+
+    def _prepare_storage_volume_requests(
+        self,
+        operation: str,
+        requests: list[Request],
+    ) -> list[Request]:
+        self._request_operation = operation
+        namespace = self._request_cache_namespace
+        if namespace is None:
+            return requests
+
+        signature = tuple(
+            (
+                request.key,
+                request.is_object,
+                request.requester_id,
+                self._slice_signature(request.tensor_slice),
+            )
+            for request in requests
+        )
+        digest = hashlib.sha256(repr(signature).encode()).hexdigest()
+        self._request_layout_id = f"{namespace}:{digest}"
+        cache = self.storage_volume_ref.transport_context.get(RequestMetadataCache)
+        if (
+            self.storage_volume_ref.volume_id,
+            operation,
+            self._request_layout_id,
+        ) in cache.published:
+            self._request_metadata_compact = True
+            return []
+        self._request_metadata_compact = False
+        volume_requests = [request.meta_only() for request in requests]
+        for request in volume_requests:
+            request.objects = None
+            if operation == "get":
+                request.tensor_slice = None
+        return volume_requests
+
+    def _publish_request_layout(self) -> None:
+        if self._request_layout_id is None or self._request_operation is None:
+            return
+        cache = self.storage_volume_ref.transport_context.get(RequestMetadataCache)
+        cache.published.add(
+            (
+                self.storage_volume_ref.volume_id,
+                self._request_operation,
+                self._request_layout_id,
+            )
+        )
+
+    def resolve_cached_requests(
+        self,
+        ctx: "TransportContext",
+        operation: str,
+        requests: list[Request],
+    ) -> list[Request]:
+        """Resolve a compact routing RPC to its cached server-side requests."""
+        self._server_request_received = True
+        request_layout_id = getattr(self, "_request_layout_id", None)
+        if request_layout_id is None:
+            return requests
+        request_operation = getattr(self, "_request_operation", None)
+        if request_operation != operation:
+            raise RuntimeError(
+                f"request layout operation mismatch: {request_operation!r} "
+                f"!= {operation!r}"
+            )
+
+        key = (operation, request_layout_id)
+        cache = ctx.get(RequestMetadataCache)
+        if requests:
+            cached = [request.meta_only() for request in requests]
+            for request in cached:
+                request.objects = None
+                request.storage_layouts = None
+            cache.layouts[key] = cached
+            return requests
+
+        cached = cache.layouts.get(key)
+        if cached is None:
+            raise RuntimeError(f"routing request metadata cache miss for {key!r}")
+        return cached
+
+    def resolve_cached_handshake_requests(
+        self,
+        ctx: "TransportContext",
+        requests: list[Request],
+    ) -> list[Request]:
+        operation = getattr(self, "_request_operation", None)
+        if operation is None:
+            return requests
+        return self.resolve_cached_requests(ctx, operation, requests)
 
     def requires_handshake(self, requests: list[Request]) -> bool:
         """Determine if a handshake is needed before the operation.
@@ -204,16 +328,18 @@ class TransportBuffer:
     async def _put_requests(self, requests: list[Request]) -> None:
         l = LatencyTracker("put")
         meta_requests = [r.meta_only() for r in requests]
+        volume_requests = self._prepare_storage_volume_requests("put", meta_requests)
         try:
             if self.requires_handshake(requests):
-                await self.perform_handshake(requests, meta_requests, l)
+                await self.perform_handshake(requests, volume_requests, l)
 
             await self._pre_put_hook(requests)
             l.track_step("_pre_put_hook")
 
-            await self.storage_volume_ref.volume.put.call(self, meta_requests)
+            await self.storage_volume_ref.volume.put.call(self, volume_requests)
             l.track_step("volume.put.call")
 
+            self._publish_request_layout()
             # Success-only hook: transports can promote staged state here,
             # while drop() still handles cleanup on both success and failure.
             await self._post_request_success()
@@ -235,19 +361,23 @@ class TransportBuffer:
     async def _get_requests(self, requests: list[Request]) -> list[Any]:
         l = LatencyTracker("get")
         meta_requests = [r.meta_only() for r in requests]
+        volume_requests = self._prepare_storage_volume_requests("get", meta_requests)
         try:
             if self.requires_handshake(requests):
-                await self.perform_handshake(requests, meta_requests, l)
+                await self.perform_handshake(requests, volume_requests, l)
 
             await self._pre_get_hook(requests)
             l.track_step("_pre_get_hook")
 
             response = await self._handle_storage_volume_response(
                 requests,
-                await self.storage_volume_ref.volume.get.call_one(self, meta_requests),
+                await self.storage_volume_ref.volume.get.call_one(
+                    self, volume_requests
+                ),
             )
             l.track_step("volume.get.call")
 
+            self._publish_request_layout()
             await self._post_request_success()
             l.track_step("_post_request_success")
         finally:
