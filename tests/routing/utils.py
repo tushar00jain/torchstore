@@ -81,4 +81,7 @@ async def registered_clients(
             for rank, state_dict in requesters.items()
         ),
     )
+    await asyncio.gather(
+        *(clients[rank].get_requester_layouts(namespace) for rank in publishers)
+    )
     return clients

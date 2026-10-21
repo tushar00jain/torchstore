@@ -16,7 +16,7 @@ from torchstore import RankRole
 from torchstore.client import ClientType
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.coordinator import RoutingCoordinator
-from torchstore.storage_volume import StorageVolume
+from torchstore.routing.storage_volume import RoutingStorageVolume
 
 
 def test_routing_namespaces_distinguish_participant_meshes(monkeypatch) -> None:
@@ -84,7 +84,7 @@ def test_routing_initialization_spawns_publisher_volumes_and_coordinator(
     spawn_volumes = AsyncMock(return_value=volumes)
     spawn_coordinator = AsyncMock(return_value=coordinator)
 
-    monkeypatch.setattr(StorageVolume, "spawn", spawn_volumes)
+    monkeypatch.setattr(RoutingStorageVolume, "spawn", spawn_volumes)
     monkeypatch.setattr(store_api, "get_or_spawn_controller", spawn_coordinator)
     monkeypatch.setattr(store_api, "current_rank", lambda: SimpleNamespace(rank=0))
     publisher = Mesh("publisher-mesh", 2)

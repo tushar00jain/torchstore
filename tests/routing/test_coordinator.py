@@ -58,7 +58,7 @@ async def test_publishers_do_not_wait_and_requesters_wait_for_publishers() -> No
         timeout=1,
     )
     layouts, _ = await asyncio.gather(
-        coordinator.get_layouts.call_one("model"),
+        coordinator.get_layouts.call_one("requester", "model"),
         coordinator.register_layout.call_one(
             "publisher/1", "model", _registration("model/second")
         ),
@@ -86,7 +86,7 @@ async def test_reuses_completed_layouts() -> None:
     await coordinator.register_layout.call_one(
         "publisher", "model", _registration("replacement/w")
     )
-    layouts = await coordinator.get_layouts.call_one("model")
+    layouts = await coordinator.get_layouts.call_one("requester", "model")
 
     assert set(layouts["publisher"]) == {"model/w"}
 
@@ -100,13 +100,13 @@ async def test_timeout_preserves_layout_for_retry(monkeypatch) -> None:
 
     with pytest.raises(ActorError, match=r"missing publishers: \['publisher'\]"):
         await asyncio.wait_for(
-            coordinator.get_layouts.call_one("model"),
+            coordinator.get_layouts.call_one("requester", "model"),
             timeout=1,
         )
 
     monkeypatch.setattr(coordinator_module, "_LAYOUT_REGISTRATION_TIMEOUT_S", timeout)
     await coordinator.register_layout.call_one("publisher", "model", _registration())
-    layouts = await coordinator.get_layouts.call_one("model")
+    layouts = await coordinator.get_layouts.call_one("requester", "model")
     assert set(layouts) == {"publisher"}
 
 
@@ -121,8 +121,38 @@ async def test_state_dict_namespaces_have_independent_layouts() -> None:
 
     results = await asyncio.gather(
         *(
-            coordinator.get_layouts.call_one(namespace)
+            coordinator.get_layouts.call_one("requester", namespace)
             for namespace in ("model", "optimizer")
         )
     )
     assert all(set(layouts) == {"publisher"} for layouts in results)
+
+
+@pytest.mark.asyncio
+async def test_exchanges_requester_layouts_symmetrically() -> None:
+    """Requesters register once and publishers read their assigned slices."""
+    coordinator = await _coordinator({"publisher/0", "publisher/1"})
+    await coordinator.register_layout.call_one("publisher/0", "model", _registration())
+    await coordinator.register_layout.call_one("publisher/1", "model", _registration())
+
+    await asyncio.gather(
+        coordinator.get_layouts.call_one("requester/0", "model"),
+        coordinator.get_layouts.call_one("requester/1", "model"),
+    )
+
+    first, second, _, _ = await asyncio.gather(
+        coordinator.get_requester_layouts.call_one("publisher/0", "model"),
+        coordinator.get_requester_layouts.call_one("publisher/1", "model"),
+        coordinator.register_requester_layout.call_one(
+            "requester/0", "model", _registration()
+        ),
+        coordinator.register_requester_layout.call_one(
+            "requester/1", "model", _registration()
+        ),
+    )
+
+    assert first == {
+        "requester/0": _registration(),
+        "requester/1": _registration(),
+    }
+    assert second == {}

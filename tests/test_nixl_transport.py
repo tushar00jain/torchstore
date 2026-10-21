@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import torchstore.transport.nixl as nixl_transport
+from torchstore.routing.storage_volume import RoutingInMemoryStore
 from torchstore.transport.buffers import TransportContext
 from torchstore.transport.nixl import (
     _NixlTransferOperation,
@@ -25,7 +26,7 @@ from torchstore.transport.nixl import (
     NixlAgentCache,
     NixlTransportBuffer,
 )
-from torchstore.transport.types import Request
+from torchstore.transport.types import Request, TensorSlice
 
 
 class FakeNixlConfig:
@@ -203,7 +204,9 @@ def ref():
     volume_ref = SimpleNamespace(
         volume_id="test-volume",
         volume=SimpleNamespace(
-            get_meta=SimpleNamespace(call_one=AsyncMock(return_value=[]))
+            get_meta=SimpleNamespace(call_one=AsyncMock(return_value=[])),
+            get=SimpleNamespace(call_one=AsyncMock()),
+            handshake=SimpleNamespace(call_one=AsyncMock()),
         ),
         transport_context=transport_context,
     )
@@ -330,6 +333,62 @@ async def test_get_writes_storage_tensor_into_client_destination(ref, ctx):
     assert agent.release_xfer_handle.call_args_list == _expected_handle_calls(
         agent.initialized
     )
+
+
+@pytest.mark.asyncio
+async def test_get_reuses_transfer_for_registered_buffers(ref):
+    destination = torch.zeros(8, dtype=torch.float16)
+    tensor_slice = TensorSlice(
+        offsets=(0,),
+        coordinates=(),
+        global_shape=(8,),
+        local_shape=(8,),
+        mesh_shape=(),
+    )
+    put_request = Request.from_any(
+        "weight", torch.arange(8, dtype=torch.float32), tensor_slice
+    )
+    put_request.storage_layouts = {"requester/0/0": (tensor_slice, torch.float16)}
+    request = Request.from_any("weight", destination, tensor_slice)
+    request.requester_id = "requester/0/0"
+    store = RoutingInMemoryStore()
+    put_buffer = SimpleNamespace(
+        handle_put_request=AsyncMock(return_value=[put_request.tensor_val])
+    )
+    await store.put(put_buffer, [put_request.meta_only()])
+
+    async def get(transport_buffer, requests):
+        return await store.get(_storage_volume_copy(transport_buffer), requests)
+
+    async def handshake(transport_buffer, requests):
+        return await store.handshake(_storage_volume_copy(transport_buffer), requests)
+
+    ref.volume.get.call_one.side_effect = get
+    ref.volume.handshake.call_one.side_effect = handshake
+
+    first = NixlTransportBuffer(ref)
+    assert await first.get_from_storage_volume([request]) == [destination]
+    assert torch.equal(destination, put_request.tensor_val.to(torch.float16))
+
+    put_request.tensor_val = torch.arange(10, 18, dtype=torch.float32)
+    update = put_request.meta_only()
+    update.storage_layouts = None
+    put_buffer.handle_put_request.return_value = [put_request.tensor_val]
+    await store.put(put_buffer, [update])
+    destination.zero_()
+    second = NixlTransportBuffer(ref)
+    assert await second.get_from_storage_volume([request]) == [destination]
+    assert torch.equal(destination, put_request.tensor_val.to(torch.float16))
+
+    ref.volume.handshake.call_one.assert_awaited_once()
+    agent = store.transport_context.get(NixlAgentCache).agent
+    assert len(agent.initialized) == 1
+    assert agent.transfer.call_args_list == [
+        call(agent.initialized[0]),
+        call(agent.initialized[0]),
+    ]
+    agent.release_xfer_handle.assert_not_called()
+    store.reset()
 
 
 @pytest.mark.asyncio

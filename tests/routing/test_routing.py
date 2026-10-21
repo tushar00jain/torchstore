@@ -22,7 +22,10 @@ async def test_multi_source_fetch_assembles_into_allocated_and_inplace_tensors()
     """Assemble two publisher shards for allocated and caller-owned outputs."""
     # 1. Represent each publisher's local rows as a DTensor shard. Fake meshes
     # avoid process-group setup while retaining real global-offset metadata.
-    local_tensors = [torch.arange(8).view(2, 4), torch.arange(8, 16).view(2, 4)]
+    local_tensors = [
+        torch.arange(8, dtype=torch.float32).view(2, 4),
+        torch.arange(8, 16, dtype=torch.float32).view(2, 4),
+    ]
     publisher_tensors = [
         DTensor.from_local(
             local_tensor,
@@ -34,7 +37,7 @@ async def test_multi_source_fetch_assembles_into_allocated_and_inplace_tensors()
         )
         for rank, local_tensor in enumerate(local_tensors)
     ]
-    destination = torch.full((4, 4), -1)
+    destination = torch.full((4, 4), -1, dtype=torch.float16)
     clients = await registered_clients(
         publishers={
             "publisher/0": {"w": publisher_tensors[0]},
@@ -51,7 +54,7 @@ async def test_multi_source_fetch_assembles_into_allocated_and_inplace_tensors()
     inplace = await clients["requester/0/0"].get("model/w", destination)
 
     # 3. Verify assembly, identity preservation, and both source-volume reads.
-    expected = torch.arange(16).view(4, 4)
+    expected = torch.arange(16, dtype=torch.float16).view(4, 4)
     torch.testing.assert_close(allocated, expected)
     torch.testing.assert_close(destination, expected)
     assert inplace is destination
