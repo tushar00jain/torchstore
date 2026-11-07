@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Collects publisher layouts so requester routes can be planned."""
+"""Exchanges publisher and requester layouts for precomputed routing."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ _LAYOUT_REGISTRATION_TIMEOUT_S = 5 * 60
 
 @dataclass
 class _Layouts:
-    """Publisher registrations for one state-dict namespace."""
+    """Publisher and requester registrations for one state-dict namespace."""
 
     publishers: Registrations = field(default_factory=dict)
     # Coordinate idempotent publisher registration with requester reads:
@@ -36,11 +36,12 @@ class _Layouts:
     # - Later calls from that publisher leave the stored layout unchanged.
     # - Once all publishers have registered, notify every requester; subsequent
     #   requesters satisfy the condition immediately and receive the same layouts.
+    requester_layouts: Registrations = field(default_factory=dict)
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
 
 
 class RoutingCoordinator(Actor):
-    """Publishes source layouts to requesters, one namespace at a time."""
+    """Exchanges fixed layouts between publishers and requesters."""
 
     def __init__(self) -> None:
         self._publishers: frozenset[str] | None = None
@@ -108,3 +109,43 @@ class RoutingCoordinator(Actor):
                     f"missing publishers: {sorted(missing)}"
                 ) from error
         return layouts.publishers
+
+    @concurrent_endpoint
+    async def register_requester_layout(
+        self,
+        rank: str,
+        key: str,
+        registrations: Mapping[str, KeyRegistration],
+    ) -> None:
+        """Record one requester's layout without waiting for other ranks."""
+        if self._publishers is None:
+            raise RuntimeError("RoutingCoordinator.init has not run")
+        layouts = self._layouts.setdefault(key, _Layouts())
+        async with layouts.condition:
+            if rank not in layouts.requester_layouts:
+                layouts.requester_layouts[rank] = dict(registrations)
+                layouts.condition.notify_all()
+
+    @concurrent_endpoint
+    async def get_requester_layouts(
+        self,
+        key: str,
+    ) -> Registrations:
+        """Wait for and return every requester layout for ``key``."""
+        if self._publishers is None:
+            raise RuntimeError("RoutingCoordinator.init has not run")
+        layouts = self._layouts.setdefault(key, _Layouts())
+        async with layouts.condition:
+            try:
+                await asyncio.wait_for(
+                    layouts.condition.wait_for(
+                        lambda: bool(layouts.requester_layouts)
+                    ),
+                    timeout=_LAYOUT_REGISTRATION_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError as error:
+                raise TimeoutError(
+                    f"timed out after {_LAYOUT_REGISTRATION_TIMEOUT_S} seconds "
+                    f"waiting for requester layouts for {key!r}"
+                ) from error
+        return layouts.requester_layouts

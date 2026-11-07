@@ -157,13 +157,16 @@ class _Builder:
             raise KeyError(f"requester keys have no publisher: {sorted(unpublished)}")
 
         key_shapes: dict[str, tuple[int, ...]] = {}
-        key_dtypes: dict[str, torch.dtype] = {}
         registrations_by_rank = [*self.publishers.values(), self.registrations]
         for registrations in registrations_by_rank:
             for key, item in registrations.items():
                 global_shape = item.tensor_slice.global_shape
                 if key_shapes.setdefault(key, global_shape) != global_shape:
                     raise ValueError(f"inconsistent global shape for key {key!r}")
+
+        key_dtypes: dict[str, torch.dtype] = {}
+        for registrations in self.publishers.values():
+            for key, item in registrations.items():
                 if key_dtypes.setdefault(key, item.dtype) != item.dtype:
                     raise ValueError(f"inconsistent dtype for key {key!r}")
 
@@ -214,9 +217,10 @@ class _Builder:
         """Build the requester's route table from real slice metadata."""
         self._validate()
 
-        for registrations in self.publishers.values():
-            for storage_key, item in registrations.items():
-                self.dtypes[storage_key] = item.dtype
+        self.dtypes = {
+            storage_key: registration.dtype
+            for storage_key, registration in self.registrations.items()
+        }
 
         self.holders_by_key = {
             storage_key: [

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from typing import Any
 
@@ -20,8 +21,8 @@ from torchstore.state_dict_utils import _state_dict_storage_metadata, DELIM, MAP
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer
 from torchstore.transport.types import Request
-from torchstore.utils import same_slice_geometry
-from ._model import KeyRegistration, RankRole
+from torchstore.utils import get_destination_view, same_slice_geometry
+from ._model import KeyRegistration, RankRole, Registrations
 from .coordinator import RoutingCoordinator
 from .directory import RoutingDirectory
 from .plan import RoutingPlan
@@ -31,6 +32,8 @@ __all__ = ["RoutingClient"]
 
 class RoutingClient(LocalClient):
     """A ``LocalClient`` backed by a rank-local precomputed directory."""
+
+    stages_state_dict_dtypes = True
 
     def __init__(
         self,
@@ -45,6 +48,10 @@ class RoutingClient(LocalClient):
         self._role = role
         self._coordinator = coordinator
         self._registered_layouts: set[str] = set()
+        self._registered_requester_layouts: set[str] = set()
+        self._requester_layouts: dict[str, dict[str, KeyRegistration]] = {}
+        self._received_requester_layouts: dict[str, Registrations] = {}
+        self._pending_storage_layouts: set[str] = set()
 
     @torch.no_grad()
     async def register_layout(
@@ -78,6 +85,34 @@ class RoutingClient(LocalClient):
             registrations=registrations,
         )
         self._registered_layouts.add(key)
+
+    @torch.no_grad()
+    async def register_requester_layout(
+        self,
+        state_dict: Mapping[str, Any] | None,
+        key: str,
+    ) -> None:
+        """Register one requester's tensor metadata without fetching layouts."""
+        if key in self._registered_requester_layouts:
+            return
+        if self._role != RankRole.REQUESTER:
+            raise RuntimeError("only requester clients register requester layouts")
+        if state_dict is None:
+            raise ValueError(
+                "user_state_dict is required to register a requester layout"
+            )
+
+        slices, dtypes, _mapping = _state_dict_storage_metadata(state_dict, key)
+        registrations = {
+            name: KeyRegistration(tensor_slice, dtype=dtypes[name])
+            for name, tensor_slice in slices.items()
+        }
+        await self._coordinator.register_requester_layout.call_one(
+            rank=self._routing_directory.rank,
+            key=key,
+            registrations=registrations,
+        )
+        self._registered_requester_layouts.add(key)
 
     @torch.no_grad()
     async def get_layouts(
@@ -122,6 +157,51 @@ class RoutingClient(LocalClient):
         self._registered_layouts.add(key)
 
     @torch.no_grad()
+    async def get_requester_layouts(self, key: str) -> Registrations:
+        """Wait for this publisher's requester layouts."""
+        if self._role != RankRole.PUBLISHER:
+            raise RuntimeError("only publisher clients get requester layouts")
+        if key in self._received_requester_layouts:
+            return self._received_requester_layouts[key]
+        rank = self._routing_directory.rank
+        requester_layouts, publisher_layouts = await asyncio.gather(
+            self._coordinator.get_requester_layouts.call_one(key=key),
+            self._coordinator.get_layouts.call_one(key=key),
+        )
+        published_keys = {
+            storage_key
+            for registrations in publisher_layouts.values()
+            for storage_key in registrations
+        }
+        layouts = {}
+        for requester, registrations in requester_layouts.items():
+            registrations = {
+                storage_key: registration
+                for storage_key, registration in registrations.items()
+                if storage_key in published_keys
+            }
+            routes = RoutingPlan.for_requester(
+                requester,
+                registrations,
+                publisher_layouts,
+            ).routes
+            served = {}
+            for storage_key, planned in routes.keys.items():
+                assert planned.route is not None
+                for transfer in planned.route.transfers:
+                    if transfer.source_volume_id == rank:
+                        served[storage_key] = KeyRegistration(
+                            transfer.segment,
+                            registrations[storage_key].dtype,
+                        )
+            if served:
+                layouts[requester] = served
+                self._requester_layouts.setdefault(requester, {}).update(served)
+                self._pending_storage_layouts.update(served)
+        self._received_requester_layouts[key] = layouts
+        return layouts
+
+    @torch.no_grad()
     async def put_batch(self, entries: dict[str, torch.Tensor | Any]) -> None:
         """Put batches to the one volume this rank publishes through."""
         assert (
@@ -143,11 +223,75 @@ class RoutingClient(LocalClient):
             self._routing_directory.routes.volume_id
         )
         transport_buffer = create_transport_buffer(storage_volume_ref)
+        requests = self._expand_put_requests(requests)
+        transport_buffer.enable_request_metadata_cache(self._routing_directory.rank)
         latency_tracker.track_step("create transport buffer")
 
         await transport_buffer.put_to_storage_volume(requests)
+        self._pending_storage_layouts.difference_update(
+            request.key for request in requests
+        )
         latency_tracker.track_step("put_to_storage_volume")
         latency_tracker.track_e2e()
+
+    def _expand_put_requests(self, requests: list[Request]) -> list[Request]:
+        """Map publisher tensors directly onto their persistent routed segments."""
+        expanded = []
+        for request in requests:
+            if request.is_object:
+                expanded.append(request)
+                continue
+
+            layouts = {
+                requester: registration
+                for requester, registrations in self._requester_layouts.items()
+                if (registration := registrations.get(request.key)) is not None
+            }
+            if not layouts:
+                expanded.append(request)
+                continue
+
+            assert request.tensor_val is not None
+            assert request.tensor_slice is not None
+            unique_layouts = {}
+            for requester, registration in layouts.items():
+                tensor_slice = registration.tensor_slice
+                signature = (
+                    registration.dtype,
+                    tensor_slice.offsets,
+                    tensor_slice.global_shape,
+                    tensor_slice.local_shape,
+                )
+                unique_layouts.setdefault(signature, (requester, registration))
+
+            storage_layouts = (
+                {
+                    requester: (registration.tensor_slice, registration.dtype)
+                    for requester, registration in layouts.items()
+                }
+                if request.key in self._pending_storage_layouts
+                else None
+            )
+            for index, (requester, registration) in enumerate(unique_layouts.values()):
+                source = get_destination_view(
+                    request.tensor_val,
+                    request.tensor_slice,
+                    registration.tensor_slice,
+                    require_contiguous=False,
+                )
+                if source is None:
+                    raise ValueError(
+                        f"requester layout for {request.key!r} is outside its "
+                        "publisher slice"
+                    )
+                segment_request = Request.from_any(
+                    request.key, source, registration.tensor_slice
+                )
+                segment_request.requester_id = requester
+                if index == 0:
+                    segment_request.storage_layouts = storage_layouts
+                expanded.append(segment_request)
+        return expanded
 
     def _match_plan(self, request: Request) -> None:
         """Check one tensor against the slice this rank was planned to store."""
@@ -208,6 +352,18 @@ class RoutingClient(LocalClient):
         tracker.track_e2e()
         return published
 
+    async def _fetch_results(
+        self,
+        volume_requests: dict[str, list[Request]],
+        transport_buffer_map: dict,
+    ) -> list[tuple[Request, Any]]:
+        for requests in volume_requests.values():
+            for request in requests:
+                request.requester_id = self._routing_directory.rank
+        for transport_buffer in transport_buffer_map.values():
+            transport_buffer.enable_request_metadata_cache(self._routing_directory.rank)
+        return await super()._fetch_results(volume_requests, transport_buffer_map)
+
     def _resolve_destinations(self, requests: list[Request]) -> None:
         """Look up each request's planned route, checking the caller's buffer."""
         targets = self._routing_directory.resolve_get_batch(
@@ -230,6 +386,7 @@ class RoutingClient(LocalClient):
         for volume_id in sorted(volumes[key]):
             volume = self.strategy.get_storage_volume(volume_id)
             transport_buffer = create_transport_buffer(volume)
+            transport_buffer.enable_request_metadata_cache(self._routing_directory.rank)
             [part] = await transport_buffer.get_from_storage_volume(
                 [Request(key=key, is_object=True)]
             )

@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -22,7 +24,10 @@ async def test_multi_source_fetch_assembles_into_allocated_and_inplace_tensors()
     """Assemble two publisher shards for allocated and caller-owned outputs."""
     # 1. Represent each publisher's local rows as a DTensor shard. Fake meshes
     # avoid process-group setup while retaining real global-offset metadata.
-    local_tensors = [torch.arange(8).view(2, 4), torch.arange(8, 16).view(2, 4)]
+    local_tensors = [
+        torch.arange(8, dtype=torch.float32).view(2, 4),
+        torch.arange(8, 16, dtype=torch.float32).view(2, 4),
+    ]
     publisher_tensors = [
         DTensor.from_local(
             local_tensor,
@@ -34,7 +39,7 @@ async def test_multi_source_fetch_assembles_into_allocated_and_inplace_tensors()
         )
         for rank, local_tensor in enumerate(local_tensors)
     ]
-    destination = torch.full((4, 4), -1)
+    destination = torch.full((4, 4), -1, dtype=torch.float16)
     clients = await registered_clients(
         publishers={
             "publisher/0": {"w": publisher_tensors[0]},
@@ -51,10 +56,35 @@ async def test_multi_source_fetch_assembles_into_allocated_and_inplace_tensors()
     inplace = await clients["requester/0/0"].get("model/w", destination)
 
     # 3. Verify assembly, identity preservation, and both source-volume reads.
-    expected = torch.arange(16).view(4, 4)
+    expected = torch.arange(16, dtype=torch.float16).view(4, 4)
     torch.testing.assert_close(allocated, expected)
     torch.testing.assert_close(destination, expected)
     assert inplace is destination
+
+
+@pytest.mark.asyncio
+async def test_state_dict_put_waits_and_stages_to_the_requester_dtype() -> None:
+    source = {"weight": torch.arange(4, dtype=torch.float32)}
+    destination = {"weight": torch.zeros(4, dtype=torch.float16)}
+    clients = await routing_clients(
+        publishers={"publisher/0": source},
+        requesters={"requester/0/0": destination},
+    )
+
+    await asyncio.gather(
+        put_state_dict(
+            clients["publisher/0"],
+            source,
+            "model",
+            transfer_dtype=torch.bfloat16,
+        ),
+        clients["requester/0/0"].register_requester_layout(destination, "model"),
+    )
+    result = await get_state_dict(clients["requester/0/0"], "model", destination)
+
+    assert result["weight"] is destination["weight"]
+    assert result["weight"].dtype == torch.float16
+    torch.testing.assert_close(result["weight"], source["weight"].to(torch.float16))
 
 
 @pytest.mark.asyncio
@@ -70,7 +100,7 @@ async def test_split_publisher_state_dict() -> None:
             "second": torch.zeros_like(second_tensor),
         }
     }
-    clients = await routing_clients(
+    clients = await registered_clients(
         publishers={
             "publisher/0": {"stage": {"first": first_tensor}},
             "publisher/1": {"stage": {"second": second_tensor}},
@@ -78,8 +108,7 @@ async def test_split_publisher_state_dict() -> None:
         requesters={"requester/0/0": destination},
     )
 
-    # 2. Lazily register layouts while publishing each fragment, then lazily
-    # register the requester and fetch into its preallocated tensors.
+    # 2. Publish each fragment, then fetch into the preallocated tensors.
     await put_state_dict(
         clients["publisher/0"], {"stage": {"first": first_tensor}}, "model"
     )
@@ -112,7 +141,7 @@ async def test_identical_mapping_entries_from_dtensor_shards_are_merged() -> Non
         for rank, local_tensor in enumerate(local_tensors)
     ]
     destination = {"w": torch.full((4,), -1)}
-    clients = await routing_clients(
+    clients = await registered_clients(
         publishers={
             "publisher/0": {"w": publisher_tensors[0]},
             "publisher/1": {"w": publisher_tensors[1]},
@@ -133,7 +162,7 @@ async def test_conflicting_mapping_entries_are_rejected() -> None:
     """Reject one flattened FQN having different nested paths across publishers."""
     first = torch.arange(2)
     second = torch.arange(2, 4)
-    clients = await routing_clients(
+    clients = await registered_clients(
         publishers={
             "publisher/0": {"first": first},
             "publisher/1": {"second": second},
@@ -168,7 +197,7 @@ async def test_source_only_mapping_entry_is_not_requested() -> None:
     """A non-strict routed read fetches only the registered key intersection."""
     first = torch.arange(2)
     extra = torch.arange(2, 4)
-    clients = await routing_clients(
+    clients = await registered_clients(
         publishers={"publisher/0": {"first": first, "extra": extra}},
         requesters={"requester/0/0": {"first": torch.zeros_like(first)}},
     )
@@ -196,9 +225,10 @@ async def test_destination_only_entry_is_ignored_by_non_strict_read() -> None:
         "weight": torch.zeros_like(source),
         "local_only": local_only,
     }
-    clients = await routing_clients(
+    clients = await registered_clients(
         publishers={"publisher/0": {"weight": source}},
         requesters={"requester/0/0": destination},
+        strict=False,
     )
 
     await put_state_dict(clients["publisher/0"], {"weight": source}, "model")

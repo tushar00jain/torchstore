@@ -75,16 +75,18 @@ def test_rejects_inconsistent_global_shapes() -> None:
         )
 
 
-def test_rejects_inconsistent_dtypes_with_the_same_element_size() -> None:
-    """Do not accept equal-width wire dtypes as interchangeable."""
+def test_uses_requester_dtype_for_the_wire_layout() -> None:
     whole = tensor_slice((0,), (8,), global_shape=(8,))
 
-    with pytest.raises(ValueError, match="inconsistent dtype"):
-        RoutingPlan.for_requester(
-            "requester",
-            {"w": KeyRegistration(whole, dtype=torch.bfloat16)},
-            {"publisher": {"w": KeyRegistration(whole, dtype=torch.float16)}},
-        )
+    plan = RoutingPlan.for_requester(
+        "requester",
+        {"w": KeyRegistration(whole, dtype=torch.float32)},
+        {"publisher": {"w": KeyRegistration(whole, dtype=torch.float16)}},
+    )
+
+    route = plan.routes.lookup("w")
+    assert route is not None
+    assert route.transfers[0].nbytes == 32
 
 
 @pytest.mark.parametrize(
