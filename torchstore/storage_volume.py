@@ -75,7 +75,14 @@ class StorageVolume(Actor):
         transport_buffer: TransportBuffer,
         requests: list[Request],
     ) -> TransportBuffer:
-        return await self.store.get(transport_buffer, requests)
+        transport_buffer._profile_event(
+            "server_request_received",
+            volume_id=self.volume_id,
+            server_host=socket.gethostname(),
+        )
+        response = await self.store.get(transport_buffer, requests)
+        transport_buffer._profile_event("server_response_sent")
+        return response
 
     @endpoint
     async def get_meta(
@@ -324,6 +331,7 @@ class InMemoryStore(StorageImpl):
                     f"Key '{request.key}' not found. {list(self.kv.keys())=}"
                 )
             data_entries.append((request, self._get_data(request)))
+        transport_buffer._profile_event("server_data_ready")
         await transport_buffer.handle_get_request(self.transport_context, data_entries)
         return transport_buffer
 

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 
 import pytest
 import torch
@@ -60,6 +61,50 @@ async def test_multi_source_fetch_assembles_into_allocated_and_inplace_tensors()
     torch.testing.assert_close(allocated, expected)
     torch.testing.assert_close(destination, expected)
     assert inplace is destination
+
+
+@pytest.mark.asyncio
+async def test_noncontiguous_slices_assemble_directly_into_inplace_tensor(
+    monkeypatch,
+) -> None:
+    local_tensors = [
+        torch.tensor([[0, 1], [4, 5], [8, 9], [12, 13]], dtype=torch.float32),
+        torch.tensor([[2, 3], [6, 7], [10, 11], [14, 15]], dtype=torch.float32),
+    ]
+    publisher_tensors = [
+        DTensor.from_local(
+            local_tensor,
+            DeviceMesh("cpu", torch.arange(2), _init_backend=False, _rank=rank),
+            [Shard(1)],
+            run_check=False,
+            shape=torch.Size((4, 4)),
+            stride=(4, 1),
+        )
+        for rank, local_tensor in enumerate(local_tensors)
+    ]
+    destination = torch.full((4, 4), -1, dtype=torch.float32)
+    clients = await registered_clients(
+        publishers={
+            "publisher/0": {"w": publisher_tensors[0]},
+            "publisher/1": {"w": publisher_tensors[1]},
+        },
+        requesters={"requester/0/0": {"w": destination}},
+    )
+
+    await clients["publisher/0"].put_batch({"model/w": publisher_tensors[0]})
+    await clients["publisher/1"].put_batch({"model/w": publisher_tensors[1]})
+    monkeypatch.setattr(
+        importlib.import_module("torchstore.client"),
+        "assemble_tensor",
+        lambda *_args, **_kwargs: pytest.fail("allocated an assembled tensor"),
+    )
+
+    result = await clients["requester/0/0"].get("model/w", destination)
+
+    assert result is destination
+    torch.testing.assert_close(
+        destination, torch.arange(16, dtype=torch.float32).view(4, 4)
+    )
 
 
 @pytest.mark.asyncio

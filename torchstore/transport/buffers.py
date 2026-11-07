@@ -30,8 +30,7 @@ class TransportCache(ABC):
         return
 
     @abstractmethod
-    def clear(self) -> None:
-        ...
+    def clear(self) -> None: ...
 
 
 class RequestMetadataCache(TransportCache):
@@ -198,6 +197,10 @@ class TransportBuffer:
         self._request_operation: str | None = None
         self._request_metadata_compact = False
         self._server_request_received = False
+
+    def _profile_event(self, event: str, **metadata: Any) -> None:
+        """Record an optional transport-specific profiling event."""
+        return
 
     def enable_request_metadata_cache(self, namespace: str) -> None:
         """Enable compact requests for a caller with immutable routing layouts."""
@@ -369,11 +372,13 @@ class TransportBuffer:
             await self._pre_get_hook(requests)
             l.track_step("_pre_get_hook")
 
+            self._profile_event("client_request_sent")
+            transport_buffer = await self.storage_volume_ref.volume.get.call_one(
+                self, volume_requests
+            )
+            self._profile_event("client_response_received")
             response = await self._handle_storage_volume_response(
-                requests,
-                await self.storage_volume_ref.volume.get.call_one(
-                    self, volume_requests
-                ),
+                requests, transport_buffer
             )
             l.track_step("volume.get.call")
 
