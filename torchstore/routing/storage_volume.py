@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import socket
 from dataclasses import dataclass
 from typing import Any
 
@@ -185,7 +186,14 @@ class RoutingStorageVolume(StorageVolume):
         transport_buffer: TransportBuffer,
         requests: list[Request],
     ) -> TransportBuffer:
+        transport_buffer._profile_event(
+            "server_request_received",
+            volume_id=self.volume_id,
+            server_host=socket.gethostname(),
+        )
         requests = transport_buffer.resolve_cached_requests(
             self.store.transport_context, "get", requests
         )
-        return await self.store.get(transport_buffer, requests)
+        response = await self.store.get(transport_buffer, requests)
+        transport_buffer._profile_event("server_response_sent")
+        return response
