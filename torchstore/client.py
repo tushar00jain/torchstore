@@ -385,14 +385,21 @@ class LocalClient:
         for request in requests:
             volume_map = volume_maps[request.key]
 
+            supports_noncontiguous_inplace = all(
+                transport_buffer_map[vid].supports_noncontiguous_inplace_resharding
+                for vid in volume_map
+            )
             use_inplace = (
                 all(
                     transport_buffer_map[vid].supports_inplace_resharding
                     for vid in volume_map
                 )
                 and request.tensor_val is not None
-                and request.tensor_val.is_contiguous()
+                and (
+                    request.tensor_val.is_contiguous() or supports_noncontiguous_inplace
+                )
             )
+            use_noncontiguous_inplace = use_inplace and supports_noncontiguous_inplace
 
             for volume_id, storage_info in volume_map.items():
                 if storage_info.object_type == ObjectType.OBJECT:
@@ -407,7 +414,12 @@ class LocalClient:
                     break
                 else:
                     volume_requests[volume_id].extend(
-                        self._expand_tensor_slices(request, storage_info, use_inplace)
+                        self._expand_tensor_slices(
+                            request,
+                            storage_info,
+                            use_inplace,
+                            use_noncontiguous_inplace,
+                        )
                     )
 
         return dict(volume_requests), whole_keys
@@ -417,6 +429,7 @@ class LocalClient:
         request: Request,
         storage_info,
         use_inplace: bool,
+        use_noncontiguous_inplace: bool,
     ) -> list[Request]:
         """Expand a single key's tensor slices into sub-requests."""
         sub_requests = []
@@ -433,10 +446,12 @@ class LocalClient:
             slice_request = Request.from_tensor_slice(request.key, fetch_slice)
 
             if use_inplace:
+                assert request.tensor_val is not None
                 dest_view = get_destination_view(
                     request.tensor_val,
                     request.tensor_slice,
                     fetch_slice,
+                    require_contiguous=not use_noncontiguous_inplace,
                 )
                 if dest_view is not None:
                     slice_request.tensor_val = dest_view
