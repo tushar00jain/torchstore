@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import cache
 from importlib.util import find_spec
+from itertools import product
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -435,8 +436,10 @@ class NixlRequestContext:
     """Serializable state for one tensor or object in a request batch."""
 
     remote_descriptors: bytes | None = None
+    remote_descriptor_sizes: tuple[int, ...] = ()
     # Client-local; stripped from RPC state because NIXL transfers its data directly.
     tensor: torch.Tensor | None = None
+    tensor_segments: tuple[torch.Tensor, ...] = ()
     shape: torch.Size | None = None
     dtype: torch.dtype | None = None
     is_object: bool = False
@@ -445,7 +448,43 @@ class NixlRequestContext:
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state["tensor"] = None
+        state["tensor_segments"] = ()
         return state
+
+
+def _contiguous_segments(tensor: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    if tensor.is_contiguous():
+        return (tensor,)
+
+    num_split_dims = 0
+    contiguous_view = tensor
+    while not contiguous_view.is_contiguous():
+        num_split_dims += 1
+        contiguous_view = tensor[(slice(0, 1),) * num_split_dims]
+
+    ranges = (range(tensor.shape[dim]) for dim in range(num_split_dims))
+    segments = tuple(
+        tensor[tuple(slice(index, index + 1) for index in indices)]
+        for indices in product(*ranges)
+    )
+    assert all(segment.is_contiguous() for segment in segments)
+    assert sum(segment.numel() for segment in segments) == tensor.numel()
+    return segments
+
+
+def _split_contiguous_tensor(
+    tensor: torch.Tensor,
+    segment_sizes: tuple[int, ...],
+) -> tuple[torch.Tensor, ...]:
+    assert tensor.is_contiguous()
+    if len(segment_sizes) == 1:
+        return (tensor,)
+
+    element_size = tensor.element_size()
+    assert all(size % element_size == 0 for size in segment_sizes)
+    segment_numels = [size // element_size for size in segment_sizes]
+    assert sum(segment_numels) == tensor.numel()
+    return tuple(tensor.flatten().split(segment_numels))
 
 
 class NixlTransportBuffer(TransportBuffer):
@@ -453,6 +492,7 @@ class NixlTransportBuffer(TransportBuffer):
 
     supports_batch_puts = True
     supports_batch_gets = True
+    supports_noncontiguous_inplace_resharding = True
 
     def __init__(self, storage_volume_ref: StorageVolumeRef) -> None:
         super().__init__(storage_volume_ref)
@@ -533,7 +573,6 @@ class NixlTransportBuffer(TransportBuffer):
         return self.storage_volume_ref.transport_context.get(NixlAgentCache)
 
     def _register_client_tensor(self, tensor: torch.Tensor) -> NixlRequestContext:
-        assert tensor.is_contiguous()
         context = NixlRequestContext(
             tensor=tensor,
             shape=tensor.shape,
@@ -545,8 +584,13 @@ class NixlTransportBuffer(TransportBuffer):
 
         cache = self._client_cache()
         cache.register(tensor)
-        descriptors = cache.agent.get_xfer_descs(tensor)
+        segments = _contiguous_segments(tensor)
+        descriptors = cache.agent.get_xfer_descs(
+            segments if len(segments) > 1 else tensor
+        )
         context.remote_descriptors = cache.agent.get_serialized_descs(descriptors)
+        context.remote_descriptor_sizes = tuple(segment.nbytes for segment in segments)
+        context.tensor_segments = segments
         return context
 
     def _publish_client_metadata(self) -> None:
@@ -591,14 +635,18 @@ class NixlTransportBuffer(TransportBuffer):
         if not all(handshake_results):
             self._keys = None
 
-    @staticmethod
     def _get_keys(
+        self,
         requests: list[Request],
     ) -> tuple[str, ...] | None:
         keys = []
         for request in requests:
             tensor = request.tensor_val
-            if request.is_object or tensor is None or not tensor.is_contiguous():
+            if (
+                request.is_object
+                or tensor is None
+                or (not tensor.is_contiguous() and self._request_layout_id is None)
+            ):
                 return None
             if tensor.numel() != 0:
                 keys.append(request.key)
@@ -696,7 +744,7 @@ class NixlTransportBuffer(TransportBuffer):
         self,
         ctx: TransportContext,
         operation: _NixlTransferOperation,
-        transfers: list[tuple[Request, torch.Tensor, bytes | None]],
+        transfers: list[tuple[Request, torch.Tensor, bytes | None, tuple[int, ...]]],
         *,
         prepared_handles: tuple[Any, ...] | None = None,
         keep_handles: bool = False,
@@ -705,12 +753,15 @@ class NixlTransportBuffer(TransportBuffer):
             return ()
 
         self._profile_event("server_transfer_prepare_started")
-        self._profile_transfer_bytes = sum(tensor.nbytes for _, tensor, _ in transfers)
+        self._profile_transfer_bytes = sum(
+            tensor.nbytes for _, tensor, _, _ in transfers
+        )
         started = time.perf_counter()
         cache = ctx.get(NixlAgentCache)
         remote_agent = self._connect_client(cache) if prepared_handles is None else None
         self._profile_prepared_layout_reused = prepared_handles is not None
         transfer_groups: dict[tuple[Any, Any], tuple[Any, Any]] = {}
+        local_segment_tensors: list[torch.Tensor] = []
         handles = list(prepared_handles or ())
         dispatch_error: Exception | None = None
         completed = False
@@ -718,12 +769,19 @@ class NixlTransportBuffer(TransportBuffer):
         nic_active = _NIC_COUNTER_SAMPLER.begin(self._profile_request_id, "publisher")
         nic_baseline: _NicCounterSnapshot | None = None
         try:
-            for _, tensor, serialized_remote_descs in (
+            for _, tensor, serialized_remote_descs, remote_descriptor_sizes in (
                 transfers if prepared_handles is None else ()
             ):
                 assert serialized_remote_descs is not None
                 cache.register(tensor)
-                tensor_local_descs = cache.agent.get_xfer_descs(tensor)
+                segments = _split_contiguous_tensor(
+                    tensor,
+                    remote_descriptor_sizes,
+                )
+                local_segment_tensors.extend(segments)
+                tensor_local_descs = cache.agent.get_xfer_descs(
+                    segments if len(segments) > 1 else tensor
+                )
                 tensor_remote_descs = cache.agent.deserialize_descs(
                     serialized_remote_descs
                 )
@@ -838,7 +896,7 @@ class NixlTransportBuffer(TransportBuffer):
         except Exception as error:
             raise RuntimeError(
                 f"NIXL {operation.value} failed for keys="
-                f"{[request.key for request, _, _ in transfers]!r}"
+                f"{[request.key for request, _, _, _ in transfers]!r}"
             ) from error
         finally:
             if nic_active:
@@ -867,7 +925,7 @@ class NixlTransportBuffer(TransportBuffer):
     ) -> list[Any]:
         """Called by storage volume. Read from client's source RdmaMemory (put)."""
         results: list[Any] = []
-        transfers: list[tuple[Request, torch.Tensor, bytes]] = []
+        transfers: list[tuple[Request, torch.Tensor, bytes, tuple[int, ...]]] = []
 
         for (request, tensor), request_context in zip(
             entries, self._contexts, strict=True
@@ -888,7 +946,14 @@ class NixlTransportBuffer(TransportBuffer):
             # Empty tensors have no bytes to move or NIXL descriptors to transfer.
             if tensor.numel() != 0:
                 assert request_context.remote_descriptors is not None
-                transfers.append((request, tensor, request_context.remote_descriptors))
+                transfers.append(
+                    (
+                        request,
+                        tensor,
+                        request_context.remote_descriptors,
+                        request_context.remote_descriptor_sizes,
+                    )
+                )
             results.append(tensor)
         await self._transfer(ctx, _NixlTransferOperation.READ, transfers)
         return results
@@ -921,7 +986,7 @@ class NixlTransportBuffer(TransportBuffer):
                     data, request_context.dtype, request_context.shape
                 )
                 if data.numel() != 0:
-                    transfers.append((request, data, None))
+                    transfers.append((request, data, None, ()))
             prepared.in_use = True
             try:
                 await self._transfer(
@@ -938,8 +1003,12 @@ class NixlTransportBuffer(TransportBuffer):
                 self._routed_get_complete = True
             return
 
-        direct_transfers: list[tuple[Request, torch.Tensor, bytes]] = []
-        staged_transfers: list[tuple[Request, torch.Tensor, bytes]] = []
+        direct_transfers: list[tuple[Request, torch.Tensor, bytes, tuple[int, ...]]] = (
+            []
+        )
+        staged_transfers: list[tuple[Request, torch.Tensor, bytes, tuple[int, ...]]] = (
+            []
+        )
 
         for (request, data), request_context in zip(
             entries, self._contexts, strict=True
@@ -962,11 +1031,21 @@ class NixlTransportBuffer(TransportBuffer):
             assert request_context.remote_descriptors is not None
             if data.is_contiguous():
                 direct_transfers.append(
-                    (request, data, request_context.remote_descriptors)
+                    (
+                        request,
+                        data,
+                        request_context.remote_descriptors,
+                        request_context.remote_descriptor_sizes,
+                    )
                 )
             else:
                 staged_transfers.append(
-                    (request, data, request_context.remote_descriptors)
+                    (
+                        request,
+                        data,
+                        request_context.remote_descriptors,
+                        request_context.remote_descriptor_sizes,
+                    )
                 )
 
         if self._keys is not None and not staged_transfers:
@@ -1006,7 +1085,7 @@ class NixlTransportBuffer(TransportBuffer):
             return
 
         cache = ctx.get(NixlAgentCache)
-        transfer_batch: list[tuple[Request, torch.Tensor, bytes]] = []
+        transfer_batch: list[tuple[Request, torch.Tensor, bytes, tuple[int, ...]]] = []
         transfer_batch_size = 0
 
         async def flush_transfer_batch() -> None:
@@ -1020,7 +1099,12 @@ class NixlTransportBuffer(TransportBuffer):
                 transfer_batch_size = 0
 
         try:
-            for request, tensor, remote_descriptors in staged_transfers:
+            for (
+                request,
+                tensor,
+                remote_descriptors,
+                remote_descriptor_sizes,
+            ) in staged_transfers:
                 transfer_size = tensor.numel() * tensor.element_size()
                 while not await cache.get_staging_limiter.acquire(
                     transfer_size, blocking=not transfer_batch
@@ -1028,7 +1112,12 @@ class NixlTransportBuffer(TransportBuffer):
                     await flush_transfer_batch()
                 transfer_batch_size += transfer_size
                 transfer_batch.append(
-                    (request, tensor.contiguous(), remote_descriptors)
+                    (
+                        request,
+                        tensor.contiguous(),
+                        remote_descriptors,
+                        remote_descriptor_sizes,
+                    )
                 )
             await flush_transfer_batch()
         finally:
