@@ -11,6 +11,7 @@ import torch
 from monarch.actor import endpoint
 
 from torchstore.storage_volume import InMemoryStore, StorageImpl, StorageVolume
+from torchstore.tensor_allocator import allocate_tensor_views
 from torchstore.transport.buffers import TransportBuffer
 from torchstore.transport.types import Request, TensorSlice
 from torchstore.utils import get_destination_view, same_slice_geometry
@@ -28,32 +29,56 @@ class _RoutedTensor:
 
 
 class RoutingInMemoryStore(InMemoryStore):
-    def _register_storage_layouts(self, request: Request) -> None:
-        assert request.storage_layouts is not None
-        stored = self.kv.get(request.key)
-        routed = stored if isinstance(stored, _RoutedTensor) else _RoutedTensor({})
-        for requester, (tensor_slice, dtype) in request.storage_layouts.items():
-            segment = next(
-                (
-                    segment
-                    for segment in routed.requesters.values()
-                    if segment.tensor.dtype == dtype
-                    and same_slice_geometry(segment.tensor_slice, tensor_slice)
-                ),
-                None,
-            )
-            if segment is None:
-                segment = _StoredSegment(
-                    tensor_slice,
-                    torch.empty(
-                        tensor_slice.local_shape,
-                        dtype=dtype,
-                        device="cpu",
-                        pin_memory=torch.cuda.is_available(),
+    def _register_storage_layouts(self, requests: list[Request]) -> None:
+        pending = []
+        for request in requests:
+            if not request.storage_layouts:
+                continue
+            stored = self.kv.get(request.key)
+            routed = stored if isinstance(stored, _RoutedTensor) else _RoutedTensor({})
+            requested_segments = []
+            for requester, (tensor_slice, dtype) in request.storage_layouts.items():
+                segment = next(
+                    (
+                        segment
+                        for segment in routed.requesters.values()
+                        if segment.tensor.dtype == dtype
+                        and same_slice_geometry(segment.tensor_slice, tensor_slice)
                     ),
+                    None,
                 )
-            routed.requesters[requester] = segment
-        self.kv[request.key] = routed
+                if segment is None:
+                    segment = next(
+                        (
+                            candidate
+                            for _, candidate in requested_segments
+                            if candidate.tensor.dtype == dtype
+                            and same_slice_geometry(
+                                candidate.tensor_slice, tensor_slice
+                            )
+                        ),
+                        None,
+                    )
+                if segment is None:
+                    segment = _StoredSegment(
+                        tensor_slice,
+                        torch.empty(0, dtype=dtype, device="cpu"),
+                    )
+                    pending.append(segment)
+                requested_segments.append((requester, segment))
+            for requester, segment in requested_segments:
+                routed.requesters[requester] = segment
+            self.kv[request.key] = routed
+
+        views = allocate_tensor_views(
+            (
+                (segment.tensor_slice.local_shape, segment.tensor.dtype)
+                for segment in pending
+            ),
+            pin_memory=torch.cuda.is_available(),
+        )
+        for segment, view in zip(pending, views, strict=True):
+            segment.tensor = view
 
     def _store_routed_tensor(self, request: Request, tensor: torch.Tensor) -> None:
         assert request.tensor_slice is not None
@@ -89,9 +114,7 @@ class RoutingInMemoryStore(InMemoryStore):
         transport_buffer: TransportBuffer,
         requests: list[Request],
     ) -> None:
-        for request in requests:
-            if request.storage_layouts:
-                self._register_storage_layouts(request)
+        self._register_storage_layouts(requests)
         await super().put(transport_buffer, requests)
 
     async def handshake(
@@ -99,9 +122,8 @@ class RoutingInMemoryStore(InMemoryStore):
         transport_buffer: TransportBuffer,
         requests: list[Request],
     ) -> list[Any]:
+        self._register_storage_layouts(requests)
         for request in requests:
-            if request.storage_layouts:
-                self._register_storage_layouts(request)
             request.stable_storage = self._segment(request) is not None
         return await super().handshake(transport_buffer, requests)
 

@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from torchstore.routing.storage_volume import RoutingInMemoryStore
 from torchstore.transport.buffers import TransportBuffer, TransportContext
 from torchstore.transport.types import Request, TensorSlice
@@ -22,6 +21,28 @@ def _whole_slice() -> TensorSlice:
         local_shape=(4,),
         mesh_shape=(),
     )
+
+
+def test_routed_layouts_pack_tensors() -> None:
+    store = RoutingInMemoryStore()
+    first = Request.from_any("first", torch.empty(4), _whole_slice())
+    second = Request.from_any("second", torch.empty(4), _whole_slice())
+    first.requester_id = "requester"
+    second.requester_id = "requester"
+    first.storage_layouts = {"requester": (_whole_slice(), torch.bfloat16)}
+    second.storage_layouts = {"requester": (_whole_slice(), torch.float32)}
+
+    store._register_storage_layouts([first, second])
+
+    first_segment = store._segment(first)
+    second_segment = store._segment(second)
+    assert first_segment is not None
+    assert second_segment is not None
+    assert (
+        first_segment.tensor.untyped_storage().data_ptr()
+        == second_segment.tensor.untyped_storage().data_ptr()
+    )
+    assert first_segment.tensor.data_ptr() != second_segment.tensor.data_ptr()
 
 
 @pytest.mark.asyncio
