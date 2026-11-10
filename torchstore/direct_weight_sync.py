@@ -101,6 +101,7 @@ class DirectWeightSyncSource:
         state_dict: dict[str, torch.Tensor],
         rank: int,
         transfer_dtype: torch.dtype | None = None,
+        preserve_dtype_keys: frozenset[str] = frozenset(),
     ) -> dict[str, RDMAWeightHandle]:
         """Create RDMA handles for every parameter in *state_dict*.
 
@@ -111,6 +112,7 @@ class DirectWeightSyncSource:
                 transfer. A staging buffer is allocated for every param
                 so that :meth:`refresh` can re-cast from the original
                 source tensors after optimizer updates.
+            preserve_dtype_keys: State-dict keys that retain their source dtype.
 
 
         Returns a dict of serializable :class:`RDMAWeightHandle` objects
@@ -127,7 +129,7 @@ class DirectWeightSyncSource:
             local_tensor = req.tensor_val
             tensor_slice = _request_to_slice(req, param)
 
-            if transfer_dtype is not None:
+            if transfer_dtype is not None and name not in preserve_dtype_keys:
                 # Always stage: cast to transfer dtype for RDMA transfer.
                 # refresh() will re-copy from the original source tensor.
                 buf_tensor = local_tensor.to(transfer_dtype).contiguous()

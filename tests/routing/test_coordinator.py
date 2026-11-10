@@ -126,3 +126,22 @@ async def test_state_dict_namespaces_have_independent_layouts() -> None:
         )
     )
     assert all(set(layouts) == {"publisher"} for layouts in results)
+
+
+@pytest.mark.asyncio
+async def test_exchanges_requester_layouts_symmetrically() -> None:
+    """Requesters register once and publishers read their assigned slices."""
+    coordinator = await _coordinator({"publisher/0", "publisher/1"})
+    await coordinator.register_layout.call_one("publisher/0", "model", _registration())
+    await coordinator.register_layout.call_one("publisher/1", "model", _registration())
+
+    first, second, _ = await asyncio.gather(
+        coordinator.get_requester_layouts.call_one("model"),
+        coordinator.get_requester_layouts.call_one("model"),
+        coordinator.register_requester_layout.call_one(
+            "requester/0", "model", _registration()
+        ),
+    )
+
+    assert first == {"requester/0": _registration()}
+    assert second == first
