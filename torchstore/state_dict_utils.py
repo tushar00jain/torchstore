@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import asyncio
 import logging
 from collections import defaultdict
 from collections.abc import Mapping
@@ -173,11 +174,14 @@ async def put_state_dict(
             f"preserve_dtype_keys not in the state dict: {sorted(unknown_keys)}"
         )
 
-    await store.register_layout(
-        state_dict,
-        key,
-        transfer_dtype=transfer_dtype,
-        preserve_dtype_keys=preserve_dtype_keys,
+    await asyncio.gather(
+        store.register_layout(
+            state_dict,
+            key,
+            transfer_dtype=transfer_dtype,
+            preserve_dtype_keys=preserve_dtype_keys,
+        ),
+        store.get_requester_layouts(key),
     )
     tracker.track_step("register_layout")
 

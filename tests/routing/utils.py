@@ -41,11 +41,12 @@ def tensor_slice(
 async def routing_clients(
     publishers: Mapping[str, Mapping[str, Any]],
     requesters: Mapping[str, Mapping[str, Any]],
+    transport_type: TransportType = TransportType.MonarchRPC,
 ) -> dict[str, RoutingClient]:
-    """Spawn routing infrastructure without registering state-dict layouts."""
+    """Spawn routing infrastructure and prepare requester layouts."""
     publisher_mesh = this_host().spawn_procs(per_host={"procs": len(publishers)})
     store_name = f"routing-test-{uuid.uuid4()}"
-    strategy = ts.LocalRankStrategy(TransportType.MonarchRPC)
+    strategy = ts.LocalRankStrategy(transport_type)
     await ts.initialize(
         mesh=publisher_mesh,
         strategy=strategy,
@@ -62,6 +63,12 @@ async def routing_clients(
         rank: RoutingClient(rank, role, control_plane, strategy)
         for rank, role in roles.items()
     }
+    await asyncio.gather(
+        *(
+            clients[rank].register_requester_layout(state_dict, "model")
+            for rank, state_dict in requesters.items()
+        )
+    )
     return clients
 
 
@@ -69,9 +76,10 @@ async def registered_clients(
     publishers: Mapping[str, Mapping[str, Any]],
     requesters: Mapping[str, Mapping[str, Any]],
     namespace: str = "model",
+    transport_type: TransportType = TransportType.MonarchRPC,
 ) -> dict[str, RoutingClient]:
     """Spawn clients and explicitly register layouts for low-level API tests."""
-    clients = await routing_clients(publishers, requesters)
+    clients = await routing_clients(publishers, requesters, transport_type)
     await asyncio.gather(
         *(
             clients[rank].register_layout(state_dict, namespace)

@@ -165,3 +165,17 @@ def test_client_constructs_and_caches_a_routing_client(monkeypatch, caplog) -> N
         for record in caplog.records
         if record.name == "torchstore.routing.coordinator"
     ] == ["routing control_plane=monarch strategy"]
+
+
+def test_prepare_state_dict_only_registers_requester_layout(monkeypatch) -> None:
+    routed_client = SimpleNamespace(register_requester_layout=AsyncMock())
+    monkeypatch.setattr(store_api, "client", AsyncMock(return_value=routed_client))
+    state_dict = {"weight": object()}
+
+    asyncio.run(
+        store_api.prepare_state_dict("model", state_dict, store_name="routing-test")
+    )
+
+    routed_client.register_requester_layout.assert_awaited_once_with(
+        state_dict, "model"
+    )

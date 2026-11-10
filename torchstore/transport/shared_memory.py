@@ -36,6 +36,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_CacheKey = str | tuple[str, str]
+
+
+def _cache_key(request: Request) -> _CacheKey:
+    if request.requester_id is None:
+        return request.key
+    return request.key, request.requester_id
+
+
+def _torchstore_key(cache_key: _CacheKey) -> str:
+    return cache_key if isinstance(cache_key, str) else cache_key[0]
+
 
 def is_local_to_volume(storage_volume_ref: "StorageVolumeRef") -> bool:
     """Check if client is on the same host as the storage volume."""
@@ -278,7 +290,7 @@ class SharedMemoryCache(TransportCache):
     supports_staged_replacement: bool = True
 
     def __init__(self):
-        self._storages: dict[tuple[str, bytes], torch.UntypedStorage] = {}
+        self._storages: dict[tuple[_CacheKey, bytes], torch.UntypedStorage] = {}
         self._key_locks: dict[str, _KeyLock] = {}
 
     @asynccontextmanager
@@ -304,7 +316,7 @@ class SharedMemoryCache(TransportCache):
                 if key_lock.users == 0 and self._key_locks.get(key) is key_lock:
                     del self._key_locks[key]
 
-    def _evict(self, cache_keys: list[tuple[str, bytes]]) -> None:
+    def _evict(self, cache_keys: list[tuple[_CacheKey, bytes]]) -> None:
         """Remove cached mappings and unpin their storage."""
         for cache_key in cache_keys:
             storage = self._storages.pop(cache_key, None)
@@ -313,7 +325,7 @@ class SharedMemoryCache(TransportCache):
 
     def _attach(
         self,
-        key: str,
+        key: _CacheKey,
         descriptor: SharedMemoryDescriptor,
         *,
         evict_stale: bool,
@@ -339,7 +351,7 @@ class SharedMemoryCache(TransportCache):
 
     def allocate(
         self,
-        key: str,
+        key: _CacheKey,
         shape: torch.Size,
         dtype: torch.dtype,
     ) -> tuple[SharedMemoryEntry, SharedMemoryDescriptor]:
@@ -350,11 +362,13 @@ class SharedMemoryCache(TransportCache):
         entry = self._attach(key, descriptor, evict_stale=False)
         return entry, descriptor
 
-    def attach(self, key: str, descriptor: SharedMemoryDescriptor) -> SharedMemoryEntry:
+    def attach(
+        self, key: _CacheKey, descriptor: SharedMemoryDescriptor
+    ) -> SharedMemoryEntry:
         """Attach to shared memory segment, caching the storage."""
         return self._attach(key, descriptor, evict_stale=True)
 
-    def promote(self, key: str, storage_handle: bytes) -> None:
+    def promote(self, key: _CacheKey, storage_handle: bytes) -> None:
         """Retain a committed allocation and evict older handles for its key."""
         cache_key = (key, storage_handle)
         if cache_key not in self._storages:
@@ -367,7 +381,7 @@ class SharedMemoryCache(TransportCache):
             ]
         )
 
-    def discard(self, key: str, storage_handle: bytes) -> None:
+    def discard(self, key: _CacheKey, storage_handle: bytes) -> None:
         """Discard an allocation whose request did not commit."""
         self._evict([(key, storage_handle)])
 
@@ -377,7 +391,11 @@ class SharedMemoryCache(TransportCache):
 
     def delete(self, keys: set[str]) -> None:
         """Clear cached shared-memory mappings for deleted TorchStore keys."""
-        cache_keys = [cache_key for cache_key in self._storages if cache_key[0] in keys]
+        cache_keys = [
+            cache_key
+            for cache_key in self._storages
+            if _torchstore_key(cache_key[0]) in keys
+        ]
         self._evict(cache_keys)
 
     def __del__(self):
@@ -411,6 +429,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
     supports_batch_puts = True
     supports_batch_gets = True
+    supports_noncontiguous_inplace_resharding = True
     # copy_() into the SHM segment performs the transfer_dtype cast.
     casts_on_put = True
 
@@ -421,7 +440,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
         # Batch state – one context per processed entry
         self._contexts: list[ShmContext] = []
-        self._pending_allocations: list[tuple[str, bytes]] = []
+        self._pending_allocations: list[tuple[_CacheKey, bytes]] = []
 
     def requires_handshake(self, requests: list[Request]) -> bool:
         return self._needs_handshake
@@ -480,7 +499,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         self._contexts = []
         copy_streams: dict[torch.device, torch.cuda.Stream] = {}
         for request, descriptor in zip(requests, handshake_results, strict=True):
-            key = request.key
+            key = _cache_key(request)
             if request.is_object:
                 self._contexts.append(ShmContext(objects=request.objects, use_rpc=True))
                 continue
@@ -601,7 +620,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
             ), f"No descriptor or data for key {request.key}"
 
             try:
-                client_entry = shm_cache.attach(request.key, descriptor)
+                client_entry = shm_cache.attach(_cache_key(request), descriptor)
             except RuntimeError as e:
                 if "No such file" in str(e):
                     raise RuntimeError(
@@ -624,7 +643,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
             return
 
         shm_cache = self.storage_volume_ref.transport_context.get(SharedMemoryCache)
-        committed_handles: dict[str, bytes] = {}
+        committed_handles: dict[_CacheKey, bytes] = {}
         for key, storage_handle in self._pending_allocations:
             committed_handles[key] = storage_handle
         for key, storage_handle in committed_handles.items():

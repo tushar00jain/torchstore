@@ -38,6 +38,13 @@ class _Layouts:
     lookups: int = 0
 
 
+@dataclass
+class _RequesterLayouts:
+    requesters: Registrations = field(default_factory=dict)
+    available: asyncio.Event = field(default_factory=asyncio.Event)
+    lookups: int = 0
+
+
 class LayoutRegistry:
     """Holds one routing store's publishers, strategy and publisher layouts.
 
@@ -50,6 +57,7 @@ class LayoutRegistry:
         self._publishers: frozenset[str] | None = None
         self._strategy: TorchStoreStrategy | None = None
         self._layouts: dict[str, _Layouts] = {}
+        self._requester_layouts: dict[str, _RequesterLayouts] = {}
 
     async def init(
         self,
@@ -95,6 +103,20 @@ class LayoutRegistry:
             if layouts.publishers.keys() == self._publishers:
                 layouts.complete.set()
 
+    async def register_requester_layout(
+        self,
+        rank: str,
+        key: str,
+        registrations: Mapping[str, KeyRegistration],
+    ) -> None:
+        """Record one requester's layout without changing publisher state."""
+        if self._publishers is None:
+            raise RuntimeError("RoutingCoordinator.init has not run")
+        layouts = self._requester_layouts.setdefault(key, _RequesterLayouts())
+        if rank not in layouts.requesters:
+            layouts.requesters[rank] = dict(registrations)
+            layouts.available.set()
+
     async def get_layouts(
         self,
         key: str,
@@ -139,3 +161,31 @@ class LayoutRegistry:
             if not (layouts.lookups or layouts.publishers):
                 del self._layouts[key]
         return layouts.publishers
+
+    async def get_requester_layouts(
+        self,
+        key: str,
+        *,
+        timeout_s: float | None = None,
+    ) -> Registrations:
+        """Wait for and return the requester layouts registered for ``key``."""
+        if self._publishers is None:
+            raise RuntimeError("RoutingCoordinator.init has not run")
+        if timeout_s is None:
+            timeout_s = _LAYOUT_REGISTRATION_TIMEOUT_S
+        timeout_s = timeout_s if timeout_s > 0 else 0
+        layouts = self._requester_layouts.setdefault(key, _RequesterLayouts())
+        layouts.lookups += 1
+        try:
+            await asyncio.wait_for(layouts.available.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError as error:
+            if not layouts.available.is_set():
+                raise TimeoutError(
+                    f"timed out after {timeout_s} seconds "
+                    f"waiting for requester layouts for {key!r}"
+                ) from error
+        finally:
+            layouts.lookups -= 1
+            if not (layouts.lookups or layouts.requesters):
+                del self._requester_layouts[key]
+        return layouts.requesters
