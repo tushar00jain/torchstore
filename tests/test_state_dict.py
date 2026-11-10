@@ -15,6 +15,7 @@ import torch
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 import torchstore as ts
+import torchstore.tensor_allocator as tensor_allocator
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torch.distributed.checkpoint.state_dict import (
@@ -32,6 +33,39 @@ logger = getLogger(__name__)
 
 
 MODEL_LINER_LENGTH = 10
+
+
+def test_create_pinned_state_dict_packs_tensors() -> None:
+    state_dict = {
+        "weight": torch.ones(3, 4, dtype=torch.bfloat16),
+        "nested": {"bias": torch.ones(5, dtype=torch.float32)},
+    }
+
+    result = ts.create_pinned_state_dict(state_dict)
+    flattened, _ = flatten_state_dict(result)
+    weight = flattened["weight"]
+    bias = flattened["nested.bias"]
+
+    assert weight.shape == state_dict["weight"].shape
+    assert weight.dtype == state_dict["weight"].dtype
+    assert bias.shape == state_dict["nested"]["bias"].shape
+    assert bias.dtype == state_dict["nested"]["bias"].dtype
+    assert weight.is_pinned()
+    assert bias.is_pinned()
+    assert weight.untyped_storage().data_ptr() == bias.untyped_storage().data_ptr()
+    assert weight.data_ptr() != bias.data_ptr()
+
+
+def test_tensor_allocator_bounds_storage_size(monkeypatch) -> None:
+    monkeypatch.setattr(tensor_allocator, "_MAX_STORAGE_BYTES", 32)
+
+    first, second, third = tensor_allocator.allocate_tensor_views(
+        [((4,), torch.float32), ((4,), torch.float32), ((5,), torch.float32)],
+        pin_memory=False,
+    )
+
+    assert first.untyped_storage().data_ptr() == second.untyped_storage().data_ptr()
+    assert first.untyped_storage().data_ptr() != third.untyped_storage().data_ptr()
 
 
 class UnitModule(nn.Module):

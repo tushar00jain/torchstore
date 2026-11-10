@@ -16,14 +16,50 @@ from torch.distributed.checkpoint._nested_dict import (
     flatten_state_dict,
     unflatten_state_dict,
 )
+from torch.distributed.tensor import DTensor
 
 from torchstore.logging import LatencyTracker
+from torchstore.tensor_allocator import allocate_tensor_views
 from torchstore.transport.types import Request, TensorSlice
 
 DELIM = "/"
 MAPPING = "MAPPING"
 
 logger = logging.getLogger(__name__)
+
+
+def create_pinned_state_dict(state_dict: Mapping[str, Any]) -> dict[str, Any]:
+    """Create a state dict whose local tensors use packed pinned CPU storages."""
+    flattened, mapping = flatten_state_dict(dict(state_dict))
+    local_tensors = []
+    for key, value in flattened.items():
+        if isinstance(value, DTensor):
+            local_tensors.append(value._local_tensor)
+        elif isinstance(value, torch.Tensor):
+            local_tensors.append(value)
+        else:
+            raise TypeError(
+                f"state dict only supports tensor values; {key!r} has type {type(value)}"
+            )
+
+    views = allocate_tensor_views(
+        ((tensor.shape, tensor.dtype) for tensor in local_tensors),
+        pin_memory=True,
+    )
+    output = {}
+    for (key, value), view in zip(flattened.items(), views, strict=True):
+        if isinstance(value, DTensor):
+            output[key] = DTensor.from_local(
+                view,
+                value.device_mesh,
+                value.placements,
+                run_check=False,
+                shape=value.shape,
+                stride=value.stride(),
+            )
+        else:
+            output[key] = view
+    return unflatten_state_dict(output, mapping)
 
 
 def _state_dict_storage_key(key: str, flat_key: str) -> str:

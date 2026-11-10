@@ -28,6 +28,7 @@ from torchstore.api import (
 from torchstore.client import ClientType
 from torchstore.logging import init_logging
 from torchstore.routing._model import RankRole
+from torchstore.state_dict_utils import create_pinned_state_dict
 from torchstore.strategy import (
     ControllerStorageVolumes,
     HostStrategy,
@@ -68,6 +69,7 @@ __all__ = [
     "HostStrategy",
     "ControllerStorageVolumes",
     "put_state_dict",
+    "create_pinned_state_dict",
     "prepare_state_dict",
     "get_state_dict",
     "reset_client",
