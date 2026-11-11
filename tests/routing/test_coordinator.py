@@ -135,6 +135,17 @@ class _HostedRegistry(ControlPlane):
         # Callers own their layouts, as with Monarch's pickled replies.
         return {rank: dict(registrations) for rank, registrations in layouts.items()}
 
+    async def register_requester_layout(
+        self, rank: str, key: str, registrations: Mapping[str, KeyRegistration]
+    ) -> None:
+        await self._on_host(
+            self._registry.register_requester_layout(rank, key, registrations)
+        )
+
+    async def get_requester_layouts(self, key: str) -> Registrations:
+        layouts = await self._on_host(self._registry.get_requester_layouts(key))
+        return {rank: dict(registrations) for rank, registrations in layouts.items()}
+
 
 @contextlib.asynccontextmanager
 async def _registry_store() -> AsyncIterator[Callable[[], Awaitable[_HostedRegistry]]]:
@@ -741,6 +752,8 @@ def test_coordinator_keeps_its_endpoint_kinds() -> None:
         "strategy": serial,
         "register_layout": concurrent,
         "get_layouts": concurrent,
+        "register_requester_layout": concurrent,
+        "get_requester_layouts": concurrent,
     }
 
 

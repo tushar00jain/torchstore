@@ -35,6 +35,14 @@ class _InterfaceOnly(ControlPlane):
     async def get_layouts(self, key: str) -> Any:
         raise _Reached(("get_layouts", key))
 
+    async def register_requester_layout(
+        self, rank: str, key: str, registrations: Any
+    ) -> None:
+        raise _Reached(("register_requester_layout", rank, key, sorted(registrations)))
+
+    async def get_requester_layouts(self, key: str) -> Any:
+        raise _Reached(("get_requester_layouts", key))
+
     async def strategy(self) -> Any:
         raise _Reached(("strategy",))
 

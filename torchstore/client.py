@@ -65,6 +65,16 @@ class LocalClient:
     ) -> None:
         """Hook for clients that require state-dict publisher registration."""
 
+    async def register_requester_layout(
+        self,
+        state_dict: Mapping[str, Any] | None,
+        key: str,
+    ) -> None:
+        """Hook for clients that register state-dict requester layouts."""
+
+    async def get_requester_layouts(self, key: str) -> Any:
+        """Hook for clients that prepare storage for requester layouts."""
+
     async def get_layouts(
         self,
         state_dict: Mapping[str, Any] | None,
@@ -288,13 +298,22 @@ class LocalClient:
         for request in requests:
             volume_map = volume_maps[request.key]
 
+            supports_noncontiguous_inplace = all(
+                transport_buffer_map[
+                    volume_id
+                ].supports_noncontiguous_inplace_resharding
+                for volume_id in volume_map
+            )
             use_inplace = (
                 all(
                     transport_buffer_map[vid].supports_inplace_resharding
                     for vid in volume_map
                 )
                 and request.tensor_val is not None
-                and request.tensor_val.is_contiguous()
+                and (
+                    request.tensor_val.is_contiguous()
+                    or supports_noncontiguous_inplace
+                )
             )
 
             for volume_id, storage_info in volume_map.items():
@@ -310,7 +329,12 @@ class LocalClient:
                     break
                 else:
                     volume_requests[volume_id].extend(
-                        self._expand_tensor_slices(request, storage_info, use_inplace)
+                        self._expand_tensor_slices(
+                            request,
+                            storage_info,
+                            use_inplace,
+                            supports_noncontiguous_inplace,
+                        )
                     )
 
         return dict(volume_requests), whole_keys
@@ -320,6 +344,7 @@ class LocalClient:
         request: Request,
         storage_info,
         use_inplace: bool,
+        supports_noncontiguous_inplace: bool,
     ) -> list[Request]:
         """Expand a single key's tensor slices into sub-requests."""
         sub_requests = []
@@ -341,7 +366,9 @@ class LocalClient:
                     request.tensor_slice,
                     fetch_slice,
                 )
-                if dest_view is not None:
+                if dest_view is not None and (
+                    dest_view.is_contiguous() or supports_noncontiguous_inplace
+                ):
                     slice_request.tensor_val = dest_view
 
             sub_requests.append(slice_request)

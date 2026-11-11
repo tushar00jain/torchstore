@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Collection, Mapping
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
@@ -37,6 +39,7 @@ class _InMemoryControlPlane(ControlPlane):
     def __init__(self) -> None:
         self.calls: Counter[str] = Counter()
         self._layouts: dict[str, Registrations] = {}
+        self._requester_layouts: dict[str, Registrations] = {}
 
     async def init(
         self, publishers: Collection[str], strategy: ts.TorchStoreStrategy
@@ -55,6 +58,16 @@ class _InMemoryControlPlane(ControlPlane):
     async def get_layouts(self, key: str) -> Registrations:
         self.calls["get_layouts"] += 1
         return self._layouts[key]
+
+    async def register_requester_layout(
+        self, rank: str, key: str, registrations: Mapping[str, KeyRegistration]
+    ) -> None:
+        self.calls["register_requester_layout"] += 1
+        self._requester_layouts.setdefault(key, {}).setdefault(rank, registrations)
+
+    async def get_requester_layouts(self, key: str) -> Registrations:
+        self.calls["get_requester_layouts"] += 1
+        return self._requester_layouts[key]
 
 
 def _in_memory_clients() -> tuple[_InMemoryControlPlane, RoutingClient, RoutingClient]:
@@ -139,6 +152,30 @@ async def test_routing_client_runs_on_any_control_plane() -> None:
         [transfer] = route.transfers
         assert transfer.source == "publisher/0"
 
+
+@pytest.mark.asyncio
+async def test_publisher_installs_one_storage_layout_before_put() -> None:
+    control_plane, publisher, requester = _in_memory_clients()
+    state_dict = {"w": torch.arange(4)}
+    install_layouts = AsyncMock()
+    publisher.strategy.get_storage_volume = Mock(
+        return_value=SimpleNamespace(
+            volume=SimpleNamespace(
+                install_layouts=SimpleNamespace(call_one=install_layouts)
+            )
+        )
+    )
+
+    await publisher.register_layout(state_dict, "model")
+    await requester.register_requester_layout(state_dict, "model")
+    await publisher.get_requester_layouts("model")
+
+    install_layouts.assert_awaited_once()
+    (layouts,) = install_layouts.await_args.args
+    dtype, requester_slices = layouts["model/w"]
+    assert dtype == torch.int64
+    assert set(requester_slices) == {"requester/0/0"}
+    assert requester_slices["requester/0/0"].local_shape == (4,)
 
 @pytest.mark.asyncio
 async def test_a_failed_layout_exchange_is_retried_on_the_next_sync() -> None:

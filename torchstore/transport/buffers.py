@@ -190,6 +190,7 @@ class TransportBuffer:
     """
 
     supports_inplace_resharding: bool = True
+    supports_noncontiguous_inplace_resharding: bool = False
 
     # Transitionary period. These should eventually be TRUE for all transports.
     supports_batch_puts: bool = False

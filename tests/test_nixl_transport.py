@@ -17,8 +17,8 @@ from unittest.mock import AsyncMock, call, Mock
 
 import pytest
 import torch
-
 import torchstore.transport.nixl as nixl_transport
+from torchstore.routing.storage_volume import RoutingInMemoryStore
 from torchstore.transport.buffers import TransportContext
 from torchstore.transport.nixl import (
     _NixlTransferOperation,
@@ -26,7 +26,7 @@ from torchstore.transport.nixl import (
     NixlAgentCache,
     NixlTransportBuffer,
 )
-from torchstore.transport.types import Request
+from torchstore.transport.types import Request, TensorSlice
 
 
 class FakeNixlConfig:
@@ -133,14 +133,24 @@ class FakeNixlAgent:
             self.regions.pop(descriptor, None)
 
     def get_xfer_descs(self, descs, mem_type=None):
-        if not isinstance(descs, torch.Tensor):
+        if (
+            isinstance(descs, (list, tuple))
+            and descs
+            and isinstance(descs[0], torch.Tensor)
+        ):
+            tensors = descs
+        elif not isinstance(descs, torch.Tensor):
             return FakeXferDList(descs, mem_type)
-        assert descs.numel() > 0
-        descriptor = (descs.data_ptr(), descs.nbytes, self.devices.get(id(descs), 0))
-        assert self._registered(
-            descriptor
+        else:
+            tensors = (descs,)
+        descriptors = [
+            (tensor.data_ptr(), tensor.nbytes, self.devices.get(id(tensor), 0))
+            for tensor in tensors
+        ]
+        assert all(
+            self._registered(descriptor) for descriptor in descriptors
         ), "transfer descriptor outside registered memory"
-        return FakeXferDList([descriptor], self.memory_types.get(id(descs), "DRAM"))
+        return FakeXferDList(descriptors, self.memory_types.get(id(tensors[0]), "DRAM"))
 
     def _registered(self, descriptor) -> bool:
         start, length, _ = descriptor
@@ -372,6 +382,90 @@ async def test_get_writes_storage_tensor_into_client_destination(ref, ctx):
     assert agent.release_xfer_handle.call_args_list == _expected_handle_calls(
         agent.initialized
     )
+
+
+@pytest.mark.asyncio
+async def test_routed_get_reuses_prepared_transfer(ref):
+    destination_storage = torch.zeros(4, 4, dtype=torch.float16)
+    destination = destination_storage[:, 1:3]
+    requester_slice = TensorSlice(
+        offsets=(0, 1),
+        coordinates=(),
+        global_shape=(4, 4),
+        local_shape=(4, 2),
+        mesh_shape=(),
+    )
+    put_request = Request.from_any(
+        "weight", torch.arange(8, dtype=torch.float32).reshape(4, 2), requester_slice
+    )
+    put_request.requester_id = "requester/0/0"
+    request = Request.from_any("weight", destination, requester_slice)
+    request.requester_id = "requester/0/0"
+    store = RoutingInMemoryStore()
+    store.install_layouts(
+        {
+            "weight": (
+                torch.float16,
+                {"requester/0/0": requester_slice},
+            )
+        }
+    )
+    put_buffer = SimpleNamespace(
+        handle_put_request=AsyncMock(return_value=[put_request.tensor_val])
+    )
+    await store.put(put_buffer, [put_request.meta_only()])
+
+    async def get(transport_buffer, requests):
+        if requests:
+            assert all(request.tensor_slice is None for request in requests)
+        storage_buffer = _storage_volume_copy(transport_buffer)
+        return await store.get(storage_buffer, requests)
+
+    ref.volume.get = SimpleNamespace(call_one=AsyncMock(side_effect=get))
+
+    first = NixlTransportBuffer(ref)
+    assert await first.get_from_storage_volume([request]) == [destination]
+
+    put_request.tensor_val = torch.arange(20, 28, dtype=torch.float32).reshape(4, 2)
+    update = put_request.meta_only()
+    put_buffer.handle_put_request.return_value = [put_request.tensor_val]
+    await store.put(put_buffer, [update])
+    destination.zero_()
+
+    second = NixlTransportBuffer(ref)
+    assert await second.get_from_storage_volume([request]) == [destination]
+    assert torch.equal(destination, put_request.tensor_val.to(torch.float16))
+
+    new_destination = torch.zeros_like(destination)
+    new_request = Request.from_any("weight", new_destination, requester_slice)
+    new_request.requester_id = request.requester_id
+    third = NixlTransportBuffer(ref)
+    assert await third.get_from_storage_volume([new_request]) == [new_destination]
+    assert torch.equal(
+        new_destination, put_request.tensor_val.to(torch.float16)
+    )
+
+    assert [len(call.args[1]) for call in ref.volume.get.call_one.call_args_list] == [
+        1,
+        0,
+        1,
+    ]
+    cache = store.transport_context.get(NixlAgentCache)
+    agents = [
+        transfer.agent_cache.agent
+        for transfer in cache._prepared_get_transfers.values()
+    ]
+    assert len(agents) == 2
+    assert sorted(len(agent.transfer.call_args_list) for agent in agents) == [1, 2]
+    assert sorted(
+        len(agent.initialized[0].local_descriptors) for agent in agents
+    ) == [1, 4]
+    for agent in agents:
+        assert len(agent.initialized) == 1
+        assert len(agent.initialized[0].local_descriptors) == len(
+            agent.initialized[0].remote_descriptors
+        )
+        agent.release_xfer_handle.assert_not_called()
 
 
 @pytest.mark.asyncio
