@@ -88,6 +88,9 @@ def test_put_state_dict_ignores_preserve_dtype_keys_without_transfer_dtype() -> 
         async def register_layout(self, state_dict, key, **kwargs):
             calls.append(("register_layout", kwargs))
 
+        async def get_requester_layouts(self, key):
+            pass
+
         async def put_batch(self, entries, **kwargs):
             calls.append(("put_batch", kwargs))
 

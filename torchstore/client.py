@@ -65,6 +65,16 @@ class LocalClient:
     ) -> None:
         """Hook for clients that require state-dict publisher registration."""
 
+    async def register_requester_layout(
+        self,
+        state_dict: Mapping[str, Any] | None,
+        key: str,
+    ) -> None:
+        """Hook for clients that register state-dict requester layouts."""
+
+    async def get_requester_layouts(self, key: str) -> Any:
+        """Hook for clients that prepare storage for requester layouts."""
+
     async def get_layouts(
         self,
         state_dict: Mapping[str, Any] | None,
@@ -341,7 +351,7 @@ class LocalClient:
                     request.tensor_slice,
                     fetch_slice,
                 )
-                if dest_view is not None:
+                if dest_view is not None and dest_view.is_contiguous():
                     slice_request.tensor_val = dest_view
 
             sub_requests.append(slice_request)

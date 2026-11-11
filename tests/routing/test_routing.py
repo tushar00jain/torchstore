@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import Mock
 
 import pytest
@@ -88,11 +89,13 @@ async def test_split_publisher_state_dict() -> None:
 
     # 2. Lazily register layouts while publishing each fragment, then lazily
     # register the requester and fetch into its preallocated tensors.
-    await put_state_dict(
-        clients["publisher/0"], {"stage": {"first": first_tensor}}, "model"
-    )
-    await put_state_dict(
-        clients["publisher/1"], {"stage": {"second": second_tensor}}, "model"
+    await asyncio.gather(
+        put_state_dict(
+            clients["publisher/0"], {"stage": {"first": first_tensor}}, "model"
+        ),
+        put_state_dict(
+            clients["publisher/1"], {"stage": {"second": second_tensor}}, "model"
+        ),
     )
     result = await get_state_dict(clients["requester/0/0"], "model", destination)
 
@@ -117,8 +120,14 @@ async def test_identical_mapping_entries_from_dtensor_shards_are_merged() -> Non
         requesters={"requester/0/0": destination},
     )
 
-    await put_state_dict(clients["publisher/0"], {"w": publisher_tensors[0]}, "model")
-    await put_state_dict(clients["publisher/1"], {"w": publisher_tensors[1]}, "model")
+    await asyncio.gather(
+        put_state_dict(
+            clients["publisher/0"], {"w": publisher_tensors[0]}, "model"
+        ),
+        put_state_dict(
+            clients["publisher/1"], {"w": publisher_tensors[1]}, "model"
+        ),
+    )
     result = await get_state_dict(clients["requester/0/0"], "model", destination)
 
     assert result["w"] is destination["w"]
@@ -143,8 +152,10 @@ async def test_conflicting_mapping_entries_are_rejected() -> None:
         },
     )
 
-    await put_state_dict(clients["publisher/0"], {"first": first}, "model")
-    await put_state_dict(clients["publisher/1"], {"second": second}, "model")
+    await asyncio.gather(
+        put_state_dict(clients["publisher/0"], {"first": first}, "model"),
+        put_state_dict(clients["publisher/1"], {"second": second}, "model"),
+    )
     await clients["publisher/1"].put(
         "model/MAPPING",
         {"first": ("different",), "second": ("second",)},
@@ -264,13 +275,21 @@ async def test_non_strict_reads_plan_and_fetch_one_subset_per_call() -> None:
             "publisher/0": {"first": sources["first"]},
             "publisher/1": {"second": sources["second"], "third": sources["third"]},
         },
-        requesters={"requester/0/0": {}},
+        requesters={
+            "requester/0/0": {
+                name: torch.zeros_like(source) for name, source in sources.items()
+            }
+        },
     )
-    await put_state_dict(clients["publisher/0"], {"first": sources["first"]}, "model")
-    await put_state_dict(
-        clients["publisher/1"],
-        {"second": sources["second"], "third": sources["third"]},
-        "model",
+    await asyncio.gather(
+        put_state_dict(
+            clients["publisher/0"], {"first": sources["first"]}, "model"
+        ),
+        put_state_dict(
+            clients["publisher/1"],
+            {"second": sources["second"], "third": sources["third"]},
+            "model",
+        ),
     )
     requester = clients["requester/0/0"]
     requester._control_plane = Mock(wraps=requester._control_plane)
@@ -379,8 +398,12 @@ async def test_reads_refill_requester_buffers_every_round(
     clients = await routing_clients(publishers=published[0], requesters=destinations)
 
     for round_, state_dicts in enumerate(published):
-        for publisher, state_dict in state_dicts.items():
-            await put_state_dict(clients[publisher], state_dict, "model")
+        await asyncio.gather(
+            *(
+                put_state_dict(clients[publisher], state_dict, "model")
+                for publisher, state_dict in state_dicts.items()
+            )
+        )
         for requester, destination in destinations.items():
             await get_state_dict(clients[requester], "model", destination)
         torch.testing.assert_close(

@@ -112,6 +112,7 @@ class Request:
     objects: Any | None = None
     is_object: bool = False
     transfer_dtype: torch.dtype | None = None
+    requester_id: str | None = None
 
     @classmethod
     def from_any(
@@ -231,4 +232,5 @@ class Request:
             tensor_slice=self.tensor_slice,
             objects=self.objects,
             is_object=self.is_object,
+            requester_id=self.requester_id,
         )

@@ -101,7 +101,7 @@ def test_registry_offers_the_interface_calls() -> None:
         method = getattr(LayoutRegistry, name)
         assert inspect.iscoroutinefunction(method), name
         interface = inspect.signature(getattr(ControlPlane, name))
-        if name == "get_layouts":
+        if name in {"get_layouts", "get_requester_layouts"}:
             interface = _plus_timeout(interface)
         assert inspect.signature(method) == interface, name
 
@@ -256,6 +256,25 @@ async def test_overlapping_lookups_that_miss_leave_no_entry() -> None:
     )
     assert all(isinstance(result, TimeoutError) for result in results), results
     assert registry._layouts == {}
+
+
+@pytest.mark.asyncio
+async def test_requester_layouts_do_not_change_publisher_state() -> None:
+    registry = LayoutRegistry()
+    await registry.init({"publisher/0"}, object())
+
+    await registry.register_requester_layout(
+        "requester/0", "model", _registration()
+    )
+    assert registry._layouts == {}
+    assert set(registry._requester_layouts) == {"model"}
+
+    with pytest.raises(TimeoutError, match="missing publishers"):
+        await registry.get_layouts("model", timeout_s=0)
+    assert registry._layouts == {}
+
+    requester_layouts = await registry.get_requester_layouts("model", timeout_s=0)
+    assert requester_layouts == {"requester/0": _registration()}
 
 
 @pytest.mark.asyncio

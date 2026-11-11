@@ -80,6 +80,26 @@ class RoutingCoordinator(Actor):
         """
         return await self._registry.get_layouts(key, timeout_s=timeout_s)
 
+    @concurrent_endpoint
+    async def register_requester_layout(
+        self,
+        rank: str,
+        key: str,
+        registrations: Mapping[str, KeyRegistration],
+    ) -> None:
+        """Record one requester layout without waiting for publishers."""
+        await self._registry.register_requester_layout(rank, key, registrations)
+
+    @concurrent_endpoint
+    async def get_requester_layouts(
+        self,
+        key: str,
+        *,
+        timeout_s: float | None = None,
+    ) -> Registrations:
+        """Wait for and return the requester layouts for ``key``."""
+        return await self._registry.get_requester_layouts(key, timeout_s=timeout_s)
+
 
 @contextmanager
 def _timed(operation: str) -> Iterator[None]:
@@ -155,3 +175,20 @@ class MonarchControlPlane(ControlPlane):
             return await self._coordinator.get_layouts.call_one(
                 key=key, timeout_s=timeout_s
             )
+
+    async def register_requester_layout(
+        self,
+        rank: str,
+        key: str,
+        registrations: Mapping[str, KeyRegistration],
+    ) -> None:
+        with _timed(f"register_requester_layout key={key}"):
+            await self._coordinator.register_requester_layout.call_one(
+                rank=rank,
+                key=key,
+                registrations=registrations,
+            )
+
+    async def get_requester_layouts(self, key: str) -> Registrations:
+        with _timed(f"get_requester_layouts key={key}"):
+            return await self._coordinator.get_requester_layouts.call_one(key=key)
