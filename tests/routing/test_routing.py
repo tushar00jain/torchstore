@@ -14,6 +14,7 @@ import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 from torchstore.state_dict_utils import get_state_dict, put_state_dict
+from torchstore.transport import TransportType
 
 from .utils import registered_clients, routing_clients
 
@@ -64,6 +65,30 @@ async def test_multi_source_fetch_assembles_into_allocated_and_inplace_tensors()
     torch.testing.assert_close(allocated, expected)
     torch.testing.assert_close(destination, expected)
     assert inplace is destination
+
+
+@pytest.mark.asyncio
+async def test_shared_memory_routes_into_noncontiguous_destinations() -> None:
+    tensor = torch.arange(16).view(4, 4)
+    publishers = [shard(tensor, 1, rank, 2) for rank in range(2)]
+    destination = torch.full_like(tensor, -1)
+    clients = await registered_clients(
+        publishers={
+            "publisher/0": {"w": publishers[0]},
+            "publisher/1": {"w": publishers[1]},
+        },
+        requesters={"requester/0/0": {"w": destination}},
+        transport_type=TransportType.SharedMemory,
+    )
+
+    await asyncio.gather(
+        clients["publisher/0"].put_batch({"model/w": publishers[0]}),
+        clients["publisher/1"].put_batch({"model/w": publishers[1]}),
+    )
+    result = await clients["requester/0/0"].get("model/w", destination)
+
+    assert result is destination
+    torch.testing.assert_close(destination, tensor)
 
 
 @pytest.mark.asyncio
