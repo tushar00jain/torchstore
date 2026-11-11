@@ -20,6 +20,7 @@ from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinat
 from torchstore.routing.storage_volume import RoutingStorageVolume
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
+from torchstore.transport import SHM_ENABLED, TransportType
 from torchstore.transport.types import TensorSlice
 
 if TYPE_CHECKING:
@@ -127,6 +128,9 @@ async def _initialize_routing(
         1,
         mesh,
         id_func=partial(_routing_volume_id, namespace),
+        shared_memory=SHM_ENABLED
+        and strategy.default_transport_type
+        in (TransportType.Unset, TransportType.SharedMemory),
     )
     await strategy.set_storage_volumes(volumes)
 

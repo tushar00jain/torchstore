@@ -32,6 +32,23 @@ class _RoutedTensor:
 
 
 class RoutingInMemoryStore(InMemoryStore):
+    def __init__(self, *, shared_memory: bool = False) -> None:
+        super().__init__()
+        self._shared_memory = shared_memory
+
+    def _allocate(self, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
+        if self._shared_memory:
+            storage = torch.UntypedStorage._new_using_filename_cpu(
+                torch.Size(shape).numel() * dtype.itemsize
+            )
+            return torch.empty(0, dtype=dtype).set_(storage).view(shape)
+        return torch.empty(
+            shape,
+            dtype=dtype,
+            device="cpu",
+            pin_memory=torch.cuda.is_available(),
+        )
+
     def install_layouts(self, layouts: _StorageLayouts) -> None:
         for key, (dtype, requesters) in layouts.items():
             stored = self.kv.get(key)
@@ -65,12 +82,7 @@ class RoutingInMemoryStore(InMemoryStore):
                 if segment is None:
                     segment = _StoredSegment(
                         requester_slice,
-                        torch.empty(
-                            requester_slice.local_shape,
-                            dtype=dtype,
-                            device="cpu",
-                            pin_memory=torch.cuda.is_available(),
-                        ),
+                        self._allocate(requester_slice.local_shape, dtype),
                     )
                 stored.requesters[requester] = segment
 
@@ -124,8 +136,8 @@ class RoutingInMemoryStore(InMemoryStore):
 
 
 class RoutingStorageVolume(StorageVolume):
-    def __init__(self, id_func) -> None:
-        self.store = RoutingInMemoryStore()
+    def __init__(self, id_func, shared_memory: bool = False) -> None:
+        self.store = RoutingInMemoryStore(shared_memory=shared_memory)
         self.volume_id: str = id_func()
 
     @endpoint

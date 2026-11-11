@@ -20,8 +20,11 @@ def _slice(offset: int, size: int, total: int = 8) -> TensorSlice:
     )
 
 
-def test_routed_layouts_share_identical_requester_segments() -> None:
-    store = RoutingInMemoryStore()
+@pytest.mark.parametrize("shared_memory", [False, True])
+def test_routed_layouts_share_identical_requester_segments(
+    shared_memory: bool,
+) -> None:
+    store = RoutingInMemoryStore(shared_memory=shared_memory)
     store.install_layouts(
         {
             "weight": (
@@ -39,6 +42,7 @@ def test_routed_layouts_share_identical_requester_segments() -> None:
     second = Request(key="weight", requester_id="requester-b")
     third = Request(key="weight", requester_id="requester-c")
     assert store._get_data(first).is_contiguous()
+    assert store._get_data(first).is_shared() is shared_memory
     assert (
         store._get_data(first).untyped_storage().data_ptr()
         == store._get_data(second).untyped_storage().data_ptr()

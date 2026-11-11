@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import cache
 from importlib.util import find_spec
+from itertools import product
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -80,7 +81,7 @@ def _aligned(nbytes: int) -> int:
     return -(-nbytes // _STAGING_ALIGNMENT) * _STAGING_ALIGNMENT
 
 
-async def _wait_terminal(tasks: list[asyncio.Task[None]]) -> None:
+async def _wait_terminal(tasks: list[asyncio.Task[Any]]) -> None:
     """Wait until every task is done, even if cancelled meanwhile.
 
     Returning early could free storage while DMA may still use it.
@@ -116,6 +117,62 @@ def _staging_pieces(tensor: torch.Tensor, max_bytes: int):
     rows = max_bytes // row_bytes
     for start in range(0, tensor.shape[0], rows):
         yield tensor[start : start + rows]
+
+
+def _contiguous_segments(tensor: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    if tensor.is_contiguous():
+        return (tensor,)
+
+    num_split_dims = 0
+    segment = tensor
+    while not segment.is_contiguous():
+        num_split_dims += 1
+        segment = tensor[(slice(0, 1),) * num_split_dims]
+
+    return tuple(
+        tensor[tuple(slice(index, index + 1) for index in indices)]
+        for indices in product(
+            *(range(tensor.shape[dim]) for dim in range(num_split_dims))
+        )
+    )
+
+
+def _align_descriptors(agent, local_descs, remote_descs):
+    local_sizes = [local_descs[index][1] for index in range(local_descs.descCount())]
+    remote_sizes = [
+        remote_descs[index][1] for index in range(remote_descs.descCount())
+    ]
+    if local_sizes == remote_sizes:
+        return local_descs, remote_descs
+    assert sum(local_sizes) == sum(remote_sizes)
+
+    local_regions = []
+    remote_regions = []
+    local_index = remote_index = 0
+    local_offset = remote_offset = 0
+    while local_index < len(local_sizes) and remote_index < len(remote_sizes):
+        size = min(
+            local_sizes[local_index] - local_offset,
+            remote_sizes[remote_index] - remote_offset,
+        )
+        local_addr, _, local_device = local_descs[local_index]
+        remote_addr, _, remote_device = remote_descs[remote_index]
+        local_regions.append((local_addr + local_offset, size, local_device))
+        remote_regions.append((remote_addr + remote_offset, size, remote_device))
+        local_offset += size
+        remote_offset += size
+        if local_offset == local_sizes[local_index]:
+            local_index += 1
+            local_offset = 0
+        if remote_offset == remote_sizes[remote_index]:
+            remote_index += 1
+            remote_offset = 0
+
+    memory_types = {agent.nixl_mems[name]: name for name in ("DRAM", "VRAM")}
+    return (
+        agent.get_xfer_descs(local_regions, memory_types[local_descs.getType()]),
+        agent.get_xfer_descs(remote_regions, memory_types[remote_descs.getType()]),
+    )
 
 
 def _storage_key(tensor: torch.Tensor) -> tuple[int, int]:
@@ -155,6 +212,23 @@ class _Registration:
     storage_ref: weakref.ReferenceType[Any]
 
 
+@dataclass
+class _PreparedTransfer:
+    agent_cache: NixlAgentCache
+    handles: tuple[Any, ...]
+    in_use: bool = False
+
+
+_TransferSignature = tuple[
+    tuple[str, tuple[int, int], int, int, tuple[int, ...]], ...
+]
+
+_ClientTransferKey = tuple[
+    _NixlTransferOperation, str, _TransferSignature
+]
+_PreparedTransferKey = tuple[str, _NixlTransferOperation, str]
+
+
 class NixlAgentCache(TransportCache):
     """Process-local NIXL agent and reusable memory registrations."""
 
@@ -179,6 +253,8 @@ class NixlAgentCache(TransportCache):
         # Storage key -> cancelled gets whose storage volume may still write into it.
         self._abandoned: Counter[tuple[int, int]] = Counter()
         self._remote_agents: dict[str, bytes] = {}
+        self._client_transfer_ids: dict[_ClientTransferKey, str] = {}
+        self._prepared_transfers: dict[_PreparedTransferKey, _PreparedTransfer] = {}
 
     def register(self, tensor: torch.Tensor) -> Any:
         """Register a tensor's whole storage once for the lifetime of that storage.
@@ -279,6 +355,9 @@ class NixlAgentCache(TransportCache):
             return
         self.agent.deregister_memory(registration.descriptors)
         self._registrations.pop(key, None)
+        for cache_key in list(self._client_transfer_ids):
+            if any(item[1] == key for item in cache_key[2]):
+                self._client_transfer_ids.pop(cache_key)
 
     def add_remote_agent(self, name: str, metadata: bytes) -> str:
         """Load new remote metadata, replacing an older copy when needed."""
@@ -286,6 +365,9 @@ class NixlAgentCache(TransportCache):
         if previous_metadata == metadata:
             return name
         if previous_metadata is not None:
+            for cache_key in list(self._prepared_transfers):
+                if cache_key[0] == name:
+                    self._release_prepared_transfer(cache_key)
             self.agent.remove_remote_agent(name)
         remote_name = self.agent.add_remote_agent(metadata)
         if isinstance(remote_name, bytes):
@@ -297,8 +379,22 @@ class NixlAgentCache(TransportCache):
         self._remote_agents[name] = metadata
         return remote_name
 
+    def _release_prepared_transfer(self, cache_key: _PreparedTransferKey) -> None:
+        transfer = self._prepared_transfers.pop(cache_key, None)
+        if transfer is None:
+            return
+        if transfer.in_use:
+            self._prepared_transfers[cache_key] = transfer
+            raise RuntimeError("cannot replace an active NIXL transfer")
+        for handle in transfer.handles:
+            transfer.agent_cache.agent.release_xfer_handle(handle)
+        transfer.agent_cache.clear()
+
     @override
     def clear(self) -> None:
+        for cache_key in list(self._prepared_transfers):
+            self._release_prepared_transfer(cache_key)
+        self._client_transfer_ids.clear()
         for key in list(self._registrations):
             self._evict(key)
         for remote_name in list(self._remote_agents):
@@ -329,6 +425,7 @@ class NixlTransportBuffer(TransportBuffer):
 
     supports_batch_puts = True
     supports_batch_gets = True
+    supports_noncontiguous_inplace_resharding = True
 
     def __init__(self, storage_volume_ref: StorageVolumeRef) -> None:
         super().__init__(storage_volume_ref)
@@ -343,10 +440,16 @@ class NixlTransportBuffer(TransportBuffer):
         self._contexts: list[NixlRequestContext] = []
         # Storage keys of this request's CUDA destinations acquired from the cache.
         self._leases: set[tuple[int, int]] = set()
+        self._operation: _NixlTransferOperation | None = None
+        self._signature: _TransferSignature | None = None
+        self._transfer_id: str | None = None
+        self._reuse_prepared = False
 
     def __getstate__(self) -> dict[str, Any]:
         state = super().__getstate__()
         state["_leases"] = set()
+        if self._reuse_prepared:
+            state["_contexts"] = []
         return state
 
     def _client_cache(self) -> NixlAgentCache:
@@ -355,7 +458,6 @@ class NixlTransportBuffer(TransportBuffer):
     def _register_client_tensor(
         self, tensor: torch.Tensor, *, cached: bool = True
     ) -> NixlRequestContext:
-        assert tensor.is_contiguous()
         context = NixlRequestContext(
             tensor=tensor,
             shape=tensor.shape,
@@ -370,7 +472,10 @@ class NixlTransportBuffer(TransportBuffer):
             cache.register(tensor)
         elif _storage_key(tensor) not in self._leases:
             self._leases.add(cache.acquire(tensor))
-        descriptors = cache.agent.get_xfer_descs(tensor)
+        segments = _contiguous_segments(tensor)
+        descriptors = cache.agent.get_xfer_descs(
+            segments if len(segments) > 1 else tensor
+        )
         context.remote_descriptors = cache.agent.get_serialized_descs(descriptors)
         return context
 
@@ -380,9 +485,79 @@ class NixlTransportBuffer(TransportBuffer):
             self._client_agent_name = cache.agent.name
             self._client_metadata = cache.agent.get_agent_metadata()
 
+    def _transfer_signature(
+        self, requests: list[Request]
+    ) -> _TransferSignature | None:
+        signature = []
+        has_data = False
+        for request in requests:
+            tensor = request.tensor_val
+            if (
+                request.is_object
+                or request.requester_id is None
+                or tensor is None
+                or tensor.is_cuda
+            ):
+                return None
+            if tensor.numel() != 0:
+                has_data = True
+            signature.append(
+                (
+                    request.key,
+                    _storage_key(tensor),
+                    tensor.data_ptr(),
+                    tensor.nbytes,
+                    tensor.stride(),
+                )
+            )
+        return tuple(signature) if has_data else None
+
+    def _prepare_transfer(
+        self,
+        requests: list[Request],
+        operation: _NixlTransferOperation,
+    ) -> bool:
+        self._operation = operation
+        self._signature = self._transfer_signature(requests)
+        if self._signature is None:
+            self._transfer_id = None
+            self._reuse_prepared = False
+            return False
+
+        cache_key = (
+            operation,
+            self.storage_volume_ref.volume_id,
+            self._signature,
+        )
+        self._transfer_id = self._client_cache()._client_transfer_ids.get(cache_key)
+        self._reuse_prepared = self._transfer_id is not None
+        if self._transfer_id is None:
+            self._transfer_id = uuid.uuid4().hex
+        return self._reuse_prepared
+
+    @override
+    async def _post_request_success(self) -> None:
+        if (
+            self._operation is not None
+            and self._signature is not None
+            and self._transfer_id is not None
+        ):
+            cache_key = (
+                self._operation,
+                self.storage_volume_ref.volume_id,
+                self._signature,
+            )
+            self._client_cache()._client_transfer_ids[cache_key] = self._transfer_id
+
     @override
     async def _pre_put_hook(self, requests: list[Request]) -> None:
         """Allocate RDMA memory for put (transport already set up)."""
+        if self._prepare_transfer(requests, _NixlTransferOperation.READ):
+            self._contexts = []
+            self._client_agent_name = self._client_cache().agent.name
+            self._client_metadata = None
+            return
+
         self._contexts = []
         for request in requests:
             if request.is_object:
@@ -393,19 +568,28 @@ class NixlTransportBuffer(TransportBuffer):
 
             tensor = request.tensor_val
             assert tensor is not None
-            if not tensor.is_contiguous():
-                logger.warning(
-                    "NIXL PUT received a non-contiguous tensor for key=%s; "
-                    "staging a contiguous CPU copy",
-                    request.key,
-                )
-                tensor = tensor.cpu().contiguous()
             self._contexts.append(self._register_client_tensor(tensor))
         self._publish_client_metadata()
 
     @override
     async def _pre_get_hook(self, requests: list[Request]) -> None:
         """Fetch metadata if needed and allocate RDMA buffers."""
+        if self._prepare_transfer(requests, _NixlTransferOperation.WRITE):
+            self._contexts = []
+            for request in requests:
+                tensor = request.tensor_val
+                assert tensor is not None
+                self._contexts.append(
+                    NixlRequestContext(
+                        tensor=tensor,
+                        shape=tensor.shape,
+                        dtype=tensor.dtype,
+                    )
+                )
+            self._client_agent_name = self._client_cache().agent.name
+            self._client_metadata = None
+            return
+
         # 1. fetch metadata in a single batch, preserving order
         meta_requests = [req.meta_only() for req in requests if req.tensor_val is None]
         meta_results = (
@@ -438,22 +622,36 @@ class NixlTransportBuffer(TransportBuffer):
         self,
         ctx: TransportContext,
         operation: _NixlTransferOperation,
-        transfers: list[tuple[Request, torch.Tensor, bytes]],
-    ) -> None:
-        if not transfers:
-            return
+        transfers: list[tuple[Request, torch.Tensor, bytes | None]],
+        *,
+        agent_cache: NixlAgentCache | None = None,
+        prepared_handles: tuple[Any, ...] | None = None,
+        keep_handles: bool = False,
+    ) -> tuple[Any, ...]:
+        if not transfers and prepared_handles is None:
+            return ()
 
-        cache = ctx.get(NixlAgentCache)
-        remote_agent = self._connect_client(cache)
+        cache = agent_cache or ctx.get(NixlAgentCache)
+        remote_agent = self._connect_client(cache) if prepared_handles is None else None
         transfer_groups: dict[tuple[Any, Any], tuple[Any, Any]] = {}
-        handles = []
+        handles = list(prepared_handles or ())
         dispatch_error: Exception | None = None
+        completed = False
         try:
-            for _, tensor, serialized_remote_descs in transfers:
+            for _, tensor, serialized_remote_descs in (
+                transfers if prepared_handles is None else ()
+            ):
+                assert serialized_remote_descs is not None
                 cache.register(tensor)
-                tensor_local_descs = cache.agent.get_xfer_descs(tensor)
+                segments = _contiguous_segments(tensor)
+                tensor_local_descs = cache.agent.get_xfer_descs(
+                    segments if len(segments) > 1 else tensor
+                )
                 tensor_remote_descs = cache.agent.deserialize_descs(
                     serialized_remote_descs
+                )
+                tensor_local_descs, tensor_remote_descs = _align_descriptors(
+                    cache.agent, tensor_local_descs, tensor_remote_descs
                 )
 
                 # Each NIXL descriptor list must have one memory type per side.
@@ -476,6 +674,8 @@ class NixlTransportBuffer(TransportBuffer):
                         remote_descs.append(tensor_remote_descs[index])
 
             try:
+                for handle in handles:
+                    cache.agent.transfer(handle)
                 for local_descs, remote_descs in transfer_groups.values():
                     handle = cache.agent.initialize_xfer(
                         operation.value,
@@ -534,6 +734,7 @@ class NixlTransportBuffer(TransportBuffer):
                 raise RuntimeError("NIXL transfer failed")
             if timed_out:
                 raise TimeoutError("NIXL transfer timed out")
+            completed = True
         except Exception as error:
             raise RuntimeError(
                 f"NIXL {operation.value} failed for keys="
@@ -542,8 +743,10 @@ class NixlTransportBuffer(TransportBuffer):
         finally:
             # Handles are released only after their transfers reach a terminal
             # state; NIXL release is assumed safe at that point.
-            for handle in handles:
-                cache.agent.release_xfer_handle(handle)
+            if not keep_handles or (prepared_handles is None and not completed):
+                for handle in handles:
+                    cache.agent.release_xfer_handle(handle)
+        return tuple(handles)
 
     def _connect_client(self, cache: NixlAgentCache) -> str:
         if self._client_agent_name is None or self._client_metadata is None:
@@ -557,6 +760,10 @@ class NixlTransportBuffer(TransportBuffer):
         entries: list[tuple[Request, Any]],
     ) -> list[Any]:
         """Called by storage volume. Read from client's source RdmaMemory (put)."""
+        if not entries:
+            await self._replay_prepared_transfer(ctx, _NixlTransferOperation.READ)
+            return []
+
         results: list[Any] = []
         transfers: list[tuple[Request, torch.Tensor, bytes]] = []
 
@@ -581,7 +788,12 @@ class NixlTransportBuffer(TransportBuffer):
                 assert request_context.remote_descriptors is not None
                 transfers.append((request, tensor, request_context.remote_descriptors))
             results.append(tensor)
-        await self._transfer(ctx, _NixlTransferOperation.READ, transfers)
+        if self._transfer_id is not None:
+            await self._cache_prepared_transfer(
+                ctx, _NixlTransferOperation.READ, transfers
+            )
+        else:
+            await self._transfer(ctx, _NixlTransferOperation.READ, transfers)
         return results
 
     @override
@@ -591,6 +803,10 @@ class NixlTransportBuffer(TransportBuffer):
         entries: list[tuple[Request, Any]],
     ) -> None:
         """Called by storage volume. Write to client's dest RdmaMemory (get)."""
+        if not entries:
+            await self._replay_prepared_transfer(ctx, _NixlTransferOperation.WRITE)
+            return
+
         transfers: list[tuple[Request, torch.Tensor, bytes]] = []
         staged: list[tuple[Request, torch.Tensor, bytes]] = []
 
@@ -612,7 +828,9 @@ class NixlTransportBuffer(TransportBuffer):
             if data.numel() == 0:
                 continue
             assert request_context.remote_descriptors is not None
-            if data.is_contiguous():
+            if data.is_contiguous() or (
+                self._transfer_id is not None and data.device.type == "cpu"
+            ):
                 transfers.append((request, data, request_context.remote_descriptors))
             elif data.device.type == "cpu":
                 staged.append((request, data, request_context.remote_descriptors))
@@ -620,6 +838,15 @@ class NixlTransportBuffer(TransportBuffer):
                 transfers.append(
                     (request, data.contiguous(), request_context.remote_descriptors)
                 )
+
+        if self._transfer_id is not None and not staged:
+            await self._cache_prepared_transfer(
+                ctx, _NixlTransferOperation.WRITE, transfers
+            )
+            return
+
+        self._signature = None
+        self._transfer_id = None
 
         tasks = [
             asyncio.create_task(
@@ -634,11 +861,67 @@ class NixlTransportBuffer(TransportBuffer):
         finally:
             await _wait_terminal(tasks)
 
+    async def _cache_prepared_transfer(
+        self,
+        ctx: TransportContext,
+        operation: _NixlTransferOperation,
+        transfers: list[tuple[Request, torch.Tensor, bytes]],
+    ) -> None:
+        assert self._transfer_id is not None
+        assert self._client_agent_name is not None
+        cache = ctx.get(NixlAgentCache)
+        cache_key = (self._client_agent_name, operation, self._transfer_id)
+        cache._release_prepared_transfer(cache_key)
+        transfer_cache = NixlAgentCache()
+        try:
+            handles = await self._transfer(
+                ctx,
+                operation,
+                transfers,
+                agent_cache=transfer_cache,
+                keep_handles=True,
+            )
+        except BaseException:
+            transfer_cache.clear()
+            raise
+        cache._prepared_transfers[cache_key] = _PreparedTransfer(
+            transfer_cache, handles
+        )
+
+    async def _replay_prepared_transfer(
+        self,
+        ctx: TransportContext,
+        operation: _NixlTransferOperation,
+    ) -> None:
+        if self._transfer_id is None or self._client_agent_name is None:
+            raise RuntimeError("NIXL request has no prepared transfer ID")
+        prepared = ctx.get(NixlAgentCache)._prepared_transfers.get(
+            (self._client_agent_name, operation, self._transfer_id)
+        )
+        if prepared is None:
+            raise RuntimeError("NIXL prepared transfer is not registered")
+        if prepared.in_use:
+            raise RuntimeError("concurrent use of a registered NIXL transfer")
+
+        prepared.in_use = True
+        try:
+            await self._transfer(
+                ctx,
+                operation,
+                [],
+                agent_cache=prepared.agent_cache,
+                prepared_handles=prepared.handles,
+                keep_handles=True,
+            )
+        finally:
+            prepared.in_use = False
+        self._contexts = []
+
     async def _write_staged(
         self,
         ctx: TransportContext,
         staged: list[tuple[Request, torch.Tensor, bytes]],
-        tasks: list[asyncio.Task[None]],
+        tasks: list[asyncio.Task[Any]],
     ) -> None:
         """Write non-contiguous CPU tensors through two reused staging buffers.
 
@@ -669,7 +952,7 @@ class NixlTransportBuffer(TransportBuffer):
         buffer_tasks: list[asyncio.Task[None] | None] = [None, None]
         index = 0
         offset = 0
-        pending: list[tuple[Request, torch.Tensor, bytes]] = []
+        pending: list[tuple[Request, torch.Tensor, bytes | None]] = []
 
         def flush() -> None:
             task = asyncio.create_task(
@@ -716,7 +999,23 @@ class NixlTransportBuffer(TransportBuffer):
         flush()
 
     @override
+    async def _call_volume_put(self, meta_requests: list[Request]) -> None:
+        for request in meta_requests:
+            request.objects = None
+            if request.requester_id is not None:
+                request.tensor_slice = None
+        if self._reuse_prepared:
+            meta_requests = []
+        await super()._call_volume_put(meta_requests)
+
+    @override
     async def _call_volume_get(self, meta_requests: list[Request]) -> TransportBuffer:
+        for request in meta_requests:
+            request.objects = None
+            if request.requester_id is not None:
+                request.tensor_slice = None
+        if self._reuse_prepared:
+            meta_requests = []
         if not self._leases:
             return await super()._call_volume_get(meta_requests)
         call = asyncio.ensure_future(super()._call_volume_get(meta_requests))
@@ -758,6 +1057,11 @@ class NixlTransportBuffer(TransportBuffer):
         transport_buffer: TransportBuffer,
     ) -> list[Any]:
         assert isinstance(transport_buffer, NixlTransportBuffer)
+        if transport_buffer._transfer_id is None:
+            self._signature = None
+            self._transfer_id = None
+        if self._reuse_prepared:
+            return [context.tensor for context in self._contexts]
         results: list[Any] = []
         for client_context, volume_context in zip(
             self._contexts, transport_buffer._contexts, strict=True
@@ -772,6 +1076,10 @@ class NixlTransportBuffer(TransportBuffer):
     async def drop(self) -> None:
         self._client_metadata = None
         self._contexts = []
+        self._operation = None
+        self._signature = None
+        self._transfer_id = None
+        self._reuse_prepared = False
         leases, self._leases = self._leases, set()
         if not leases:
             return

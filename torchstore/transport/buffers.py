@@ -190,6 +190,7 @@ class TransportBuffer:
     """
 
     supports_inplace_resharding: bool = True
+    supports_noncontiguous_inplace_resharding: bool = False
 
     # Transitionary period. These should eventually be TRUE for all transports.
     supports_batch_puts: bool = False
@@ -250,7 +251,7 @@ class TransportBuffer:
             await self._pre_put_hook(requests)
             l.track_step("_pre_put_hook")
 
-            await self.storage_volume_ref.volume.put.call(self, meta_requests)
+            await self._call_volume_put(meta_requests)
             l.track_step("volume.put.call")
 
             # Success-only hook: transports can promote staged state here,
@@ -296,6 +297,9 @@ class TransportBuffer:
 
     async def _call_volume_get(self, meta_requests: list[Request]) -> "TransportBuffer":
         return await self.storage_volume_ref.volume.get.call_one(self, meta_requests)
+
+    async def _call_volume_put(self, meta_requests: list[Request]) -> None:
+        await self.storage_volume_ref.volume.put.call(self, meta_requests)
 
     async def perform_handshake(
         self,
