@@ -66,6 +66,21 @@ class ControlPlane(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    async def register_requester_layout(
+        self,
+        rank: str,
+        key: str,
+        registrations: Mapping[str, KeyRegistration],
+    ) -> None:
+        """Record one requester's layout. Idempotent per rank, never blocks."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_requester_layouts(self, key: str) -> Registrations:
+        """Requester layouts for ``key``. Blocks until at least one is registered."""
+        raise NotImplementedError
+
+    @abstractmethod
     async def strategy(self) -> TorchStoreStrategy:
         """Return a strategy that resolves the registered publishers' volumes."""
         raise NotImplementedError
